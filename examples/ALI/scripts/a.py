@@ -1,16 +1,22 @@
-from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("examples/ALI/scripts/llama_custom_tokenizer")
 
 msgs = [
-  {"role": "system", "content": "You are helpful."},
-  {"role": "user", "content": "Say hi."}
+  {"role":"user","content":"hi"},
+  {"role":"assistant","content":"Hello"}
 ]
 
-out = tok.apply_chat_template(
+out = tokenizer.apply_chat_template(
     msgs,
-    add_generation_prompt=True,              # <-- important
+    add_generation_prompt=False,
     return_dict=True,
     return_assistant_tokens_mask=True,
 )
-print("Has assistant_masks:", "assistant_masks" in out)
-print("Assistant token count:", int(sum(out["assistant_masks"])))  # should be > 0
+
+# Print templated prompt
+print(tokenizer.decode(out["input_ids"]))
+print(out)
+print("\nHas assistant_masks:", "assistant_masks" in out)
+print("Assistant token count:", int(sum(out["assistant_masks"])))

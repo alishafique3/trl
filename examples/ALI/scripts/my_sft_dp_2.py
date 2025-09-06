@@ -88,7 +88,7 @@ def main():
 
     # Train model
     training_args = SFTConfig(
-        output_dir=f"Llama-3.2-1B-Instruct",
+        output_dir=f"examples/ALI/scripts/Llama-3.2-1B-Instruct",
         chat_template_path="meta-llama/Llama-3.2-1B-Instruct",
         assistant_only_loss=True,
         eos_token="<|eot_id|>", # FOR Llama-3.2-1B-Instruct
