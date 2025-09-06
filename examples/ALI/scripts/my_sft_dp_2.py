@@ -69,7 +69,7 @@ def main():
     # Load dataset
     train_dataset = load_dataset("tatsu-lab/alpaca", split="train")
     train_dataset = load_as_messages(train_dataset)
-    # train_dataset = train_dataset.select(range(5))
+    train_dataset = train_dataset.select(range(1000))
     print(f"length of dataset: {len(train_dataset)}")
     print(train_dataset[0])
 
@@ -77,7 +77,7 @@ def main():
     # Load model
     model_id = "meta-llama/Llama-3.2-1B-Instruct"
     model = AutoModelForCausalLM.from_pretrained(model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id) # Debug
+    tokenizer = AutoTokenizer.from_pretrained("examples/ALI/scripts/llama_custom_tokenizer") # Debug
     print_trainable_parameters(model)
 
     # # Debug: Apply chat template
@@ -89,7 +89,7 @@ def main():
     # Train model
     training_args = SFTConfig(
         output_dir=f"examples/ALI/scripts/Llama-3.2-1B-Instruct",
-        chat_template_path="meta-llama/Llama-3.2-1B-Instruct",
+        chat_template_path="examples/ALI/scripts/llama_custom_tokenizer",
         assistant_only_loss=True,
         eos_token="<|eot_id|>", # FOR Llama-3.2-1B-Instruct
         # bf16=True,

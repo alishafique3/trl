@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 tokenizer = AutoTokenizer.from_pretrained("examples/ALI/scripts/llama_custom_tokenizer")
+# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
 msgs = [
   {"role":"user","content":"hi"},
@@ -17,6 +18,8 @@ out = tokenizer.apply_chat_template(
 
 # Print templated prompt
 print(tokenizer.decode(out["input_ids"]))
+decoded_tokens = [tokenizer.decode([token_id]) for token_id in out["input_ids"]]
+print(decoded_tokens)
 print(out)
 print("\nHas assistant_masks:", "assistant_masks" in out)
 print("Assistant token count:", int(sum(out["assistant_masks"])))
