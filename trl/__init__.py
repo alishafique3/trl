@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import warnings
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .import_utils import OptionalDependencyNotAvailable, _LazyModule, is_diffusers_available
+from .import_utils import _LazyModule
 
 
 try:
@@ -37,10 +38,10 @@ _import_structure = {
         "maybe_unpair_preference_dataset",
         "pack_dataset",
         "prepare_multimodal_messages",
+        "prepare_multimodal_messages_vllm",
         "truncate_dataset",
         "unpair_preference_dataset",
     ],
-    "extras": ["BestOfNSampler"],
     "models": [
         "SUPPORTED_ARCHITECTURES",
         "AutoModelForCausalLMWithValueHead",
@@ -51,8 +52,6 @@ _import_structure = {
         "setup_chat_format",
     ],
     "trainer": [
-        "AlignPropConfig",
-        "AlignPropTrainer",
         "AllTrueJudge",
         "BaseBinaryJudge",
         "BaseJudge",
@@ -71,8 +70,6 @@ _import_structure = {
         "GRPOConfig",
         "GRPOTrainer",
         "HfPairwiseJudge",
-        "IterativeSFTConfig",
-        "IterativeSFTTrainer",
         "KTOConfig",
         "KTOTrainer",
         "LogCompletionsCallback",
@@ -99,25 +96,15 @@ _import_structure = {
         "XPOConfig",
         "XPOTrainer",
     ],
-    "trainer.callbacks": ["BEMACallback", "MergeModelCallback", "RichProgressCallback", "SyncRefModelCallback"],
+    "trainer.callbacks": [
+        "BEMACallback",
+        "MergeModelCallback",
+        "RichProgressCallback",
+        "SyncRefModelCallback",
+        "WeaveCallback",
+    ],
     "trainer.utils": ["get_kbit_device_map", "get_peft_config", "get_quantization_config"],
 }
-
-try:
-    if not is_diffusers_available():
-        raise OptionalDependencyNotAvailable()
-except OptionalDependencyNotAvailable:
-    pass
-else:
-    _import_structure["models"].extend(
-        [
-            "DDPOPipelineOutput",
-            "DDPOSchedulerOutput",
-            "DDPOStableDiffusionPipeline",
-            "DefaultDDPOStableDiffusionPipeline",
-        ]
-    )
-    _import_structure["trainer"].extend(["DDPOConfig", "DDPOTrainer"])
 
 if TYPE_CHECKING:
     from .data_utils import (
@@ -131,10 +118,10 @@ if TYPE_CHECKING:
         maybe_unpair_preference_dataset,
         pack_dataset,
         prepare_multimodal_messages,
+        prepare_multimodal_messages_vllm,
         truncate_dataset,
         unpair_preference_dataset,
     )
-    from .extras import BestOfNSampler
     from .models import (
         SUPPORTED_ARCHITECTURES,
         AutoModelForCausalLMWithValueHead,
@@ -146,8 +133,6 @@ if TYPE_CHECKING:
     )
     from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
-        AlignPropConfig,
-        AlignPropTrainer,
         AllTrueJudge,
         BaseBinaryJudge,
         BaseJudge,
@@ -166,8 +151,6 @@ if TYPE_CHECKING:
         GRPOConfig,
         GRPOTrainer,
         HfPairwiseJudge,
-        IterativeSFTConfig,
-        IterativeSFTTrainer,
         KTOConfig,
         KTOTrainer,
         LogCompletionsCallback,
@@ -194,22 +177,14 @@ if TYPE_CHECKING:
         XPOConfig,
         XPOTrainer,
     )
-    from .trainer.callbacks import BEMACallback, MergeModelCallback, RichProgressCallback, SyncRefModelCallback
+    from .trainer.callbacks import (
+        BEMACallback,
+        MergeModelCallback,
+        RichProgressCallback,
+        SyncRefModelCallback,
+        WeaveCallback,
+    )
     from .trainer.utils import get_kbit_device_map, get_peft_config, get_quantization_config
-
-    try:
-        if not is_diffusers_available():
-            raise OptionalDependencyNotAvailable()
-    except OptionalDependencyNotAvailable:
-        pass
-    else:
-        from .models import (
-            DDPOPipelineOutput,
-            DDPOSchedulerOutput,
-            DDPOStableDiffusionPipeline,
-            DefaultDDPOStableDiffusionPipeline,
-        )
-        from .trainer import DDPOConfig, DDPOTrainer
 
 else:
     import sys

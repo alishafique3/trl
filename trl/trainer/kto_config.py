@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from transformers import TrainingArguments
 
@@ -37,7 +38,7 @@ class KTOConfig(TrainingArguments):
             to use the default data collator.
         max_prompt_length (`int` or `None`, *optional*, defaults to `512`):
             Maximum length of the prompt. This argument is required if you want to use the default data collator.
-        max_completion_length (`int` or `None`, *optional*, defaults to `None`):
+        max_completion_length (`int`, *optional*):
             Maximum length of the completion. This argument is required if you want to use the default data collator
             and your model is an encoder-decoder.
         beta (`float`, *optional*, defaults to `0.1`):
@@ -56,7 +57,7 @@ class KTOConfig(TrainingArguments):
             Undesirable losses are weighed by this factor to counter unequal number of desirable and undesirable pairs.
         label_pad_token_id (`int`, *optional*, defaults to `-100`):
             Label pad token id. This argument is required if you want to use the default data collator.
-        padding_value (`int` or `None`, *optional*, defaults to `None`):
+        padding_value (`int`, *optional*):
             Padding value to use. If `None`, the padding value of the tokenizer is used.
         truncation_mode (`str`, *optional*, defaults to `"keep_end"`):
             Truncation mode to use when the prompt is too long. Possible values are `"keep_end"` or `"keep_start"`.
@@ -64,27 +65,36 @@ class KTOConfig(TrainingArguments):
         generate_during_eval (`bool`, *optional*, defaults to `False`):
             If `True`, generates and logs completions from both the model and the reference model to W&B or Comet
             during evaluation.
-        is_encoder_decoder (`bool` or `None`, *optional*, defaults to `None`):
+        is_encoder_decoder (`bool`, *optional*):
             When using the `model_init` argument (callable) to instantiate the model instead of the `model` argument,
             you need to specify if the model returned by the callable is an encoder-decoder model.
         precompute_ref_log_probs (`bool`, *optional*, defaults to `False`):
             Whether to precompute reference model log probabilities for training and evaluation datasets. This is
             useful when training without the reference model to reduce the total GPU memory needed.
-        model_init_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
+        model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the model from a
             string.
-        ref_model_init_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
+        ref_model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the reference model
             from a string.
-        dataset_num_proc: (`int` or `None`, *optional*, defaults to `None`):
+        dataset_num_proc: (`int`, *optional*):
             Number of processes to use for processing the dataset.
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model and reference model.
-        use_liger_loss (`bool`, *optional*, defaults to `False`):
-            Whether to use Liger loss. It requires liger-kernel to be installed.
+        use_liger_loss (`bool`, *optional*):
+            Whether to use Liger loss.
+
+            <Deprecated version="0.25.0">
+
+            Parameter `use_liger_loss` is deprecated and will be removed in version 0.28.0. Use `use_liger_kernel`
+            instead.
+
+            </Deprecated>
+
         base_model_attribute_name (`str`, *optional*, defaults to `"model"`):
             Name of the attribute in the model that contains the base model. This is used to get the base model from
-            the model when the model does not have a `get_decoder` method in the case when `use_liger_loss` is `True`.
+            the model when the model does not have a `get_decoder` method in the case when `use_liger_kernel` is
+            `True`.
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs", "ref_model_init_kwargs"]
@@ -107,7 +117,7 @@ class KTOConfig(TrainingArguments):
             "help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."
         },
     )
-    bf16: Optional[bool] = field(
+    bf16: bool | None = field(
         default=None,
         metadata={
             "help": "Whether to use bf16 (mixed) precision instead of 32-bit. Requires Ampere or higher NVIDIA "
@@ -115,19 +125,29 @@ class KTOConfig(TrainingArguments):
             "`fp16` is not set."
         },
     )
+    # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
+    # was fixed in https://github.com/huggingface/transformers/pull/41322, but the fix has not yet been released. We
+    # add a temporary workaround here, which can be removed once the fix is available—likely in Transformers 4.57.2.
+    lr_scheduler_kwargs: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": "Additional parameters for the lr_scheduler, such as {'num_cycles': 1} for cosine with hard "
+            "restarts."
+        },
+    )
 
-    max_length: Optional[int] = field(
+    max_length: int | None = field(
         default=1024,
         metadata={"help": "Maximum length of the sequences (prompt + completion) in the batch."},
     )
-    max_prompt_length: Optional[int] = field(
+    max_prompt_length: int | None = field(
         default=512,
         metadata={
             "help": "Maximum length of the prompt. This argument is required if you want to use the default data "
             "collator and your model is an encoder-decoder."
         },
     )
-    max_completion_length: Optional[int] = field(
+    max_completion_length: int | None = field(
         default=None,
         metadata={
             "help": "Maximum length of the completion. This argument is required if you want to use the default data "
@@ -168,7 +188,7 @@ class KTOConfig(TrainingArguments):
             "help": "Label pad token id. This argument is required if you want to use the default data collator."
         },
     )
-    padding_value: Optional[int] = field(
+    padding_value: int | None = field(
         default=None,
         metadata={"help": "Padding value to use. If `None`, the padding value of the tokenizer is used."},
     )
@@ -186,7 +206,7 @@ class KTOConfig(TrainingArguments):
             "during evaluation."
         },
     )
-    is_encoder_decoder: Optional[bool] = field(
+    is_encoder_decoder: bool | None = field(
         default=None,
         metadata={
             "help": "When using the `model_init` argument (callable) to instantiate the model instead of the `model` "
@@ -204,26 +224,26 @@ class KTOConfig(TrainingArguments):
             "This is useful when training without the reference model to reduce the total GPU memory needed."
         },
     )
-    model_init_kwargs: Optional[dict[str, Any]] = field(
+    model_init_kwargs: dict[str, Any] | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the model "
             "from a string."
         },
     )
-    ref_model_init_kwargs: Optional[dict[str, Any]] = field(
+    ref_model_init_kwargs: dict[str, Any] | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the "
             "reference model from a string."
         },
     )
-    dataset_num_proc: Optional[int] = field(
+    dataset_num_proc: int | None = field(
         default=None,
         metadata={"help": "Number of processes to use for processing the dataset."},
     )
     use_liger_loss: bool = field(
-        default=False,
+        default=None,
         metadata={"help": "Whether to use Liger loss. It requires liger-kernel to be installed."},
     )
     base_model_attribute_name: str = field(
@@ -231,11 +251,20 @@ class KTOConfig(TrainingArguments):
         metadata={
             "help": "Name of the attribute in the model that contains the base model. This is used to get the base "
             "model from the model when the model does not have a `get_decoder` method in the case when "
-            "`use_liger_loss` is `True`."
+            "`use_liger_kernel` is `True`."
         },
     )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
+
+        if self.use_liger_loss is not None:
+            warnings.warn(
+                "The `use_liger_loss` argument is deprecated and will be removed in version 0.28.0. Please use "
+                "`use_liger_kernel` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.use_liger_kernel = self.use_liger_loss
 
         super().__post_init__()

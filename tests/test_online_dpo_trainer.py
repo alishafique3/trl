@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import pytest
+import transformers
 from datasets import Dataset, features, load_dataset
-from parameterized import parameterized
+from packaging.version import Version
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
-from transformers.testing_utils import require_peft, require_torch_accelerator, require_vision
 from transformers.utils import is_peft_available, is_vision_available
 
 from trl import OnlineDPOConfig, OnlineDPOTrainer
 
-from .testing_utils import RandomPairwiseJudge, TrlTestCase, require_llm_blender, require_vllm
+from .testing_utils import (
+    RandomPairwiseJudge,
+    TrlTestCase,
+    require_llm_blender,
+    require_peft,
+    require_torch_accelerator,
+    require_vision,
+    require_vllm,
+)
 
 
 if is_peft_available():
@@ -31,12 +38,11 @@ if is_peft_available():
 if is_vision_available():
     import numpy as np
     from PIL import Image
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 class TestOnlineDPOTrainer(TrlTestCase):
-    def setUp(self):
-        super().setUp()
+    def setup_method(self):
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
         self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_id)
@@ -48,7 +54,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         self.reward_tokenizer = AutoTokenizer.from_pretrained(self.reward_model_id)
         self.reward_tokenizer.pad_token = self.reward_tokenizer.eos_token
 
-    @parameterized.expand([("standard_prompt_only",), ("conversational_prompt_only",)])
+    @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_training(self, config_name):
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
@@ -72,7 +78,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     def test_training_model_str(self):
         training_args = OnlineDPOConfig(
@@ -97,7 +103,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     def test_training_with_ref_model(self):
         training_args = OnlineDPOConfig(
@@ -123,7 +129,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     def test_ref_model_is_model(self):
         training_args = OnlineDPOConfig(
@@ -135,7 +141,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
         dummy_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
-        with self.assertRaises(ValueError):
+        with pytest.raises(ValueError):
             OnlineDPOTrainer(
                 model=self.model,
                 ref_model=self.model,  # ref_model can't be the same as model
@@ -173,7 +179,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     @require_peft
     def test_training_with_peft_and_ref_model(self):
@@ -203,7 +209,7 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     @require_peft
     def test_training_with_peft_model_and_peft_config(self):
@@ -235,10 +241,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
+    @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     @require_llm_blender
-    @parameterized.expand([("standard_prompt_only",), ("conversational_prompt_only",)])
     def test_training_with_judge(self, config_name):
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
@@ -261,13 +267,21 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
-    @parameterized.expand([("standard_prompt_only",), ("conversational_prompt_only",)])
+    @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     @require_torch_accelerator
     @require_vllm
     @pytest.mark.slow
     def test_training_with_vllm(self, config_name):
+        def cleanup_vllm_communicator(trainer):
+            """Clean up vLLM communicator to avoid conflicts between test runs"""
+            try:
+                if hasattr(trainer, "vllm_client") and trainer.vllm_client is not None:
+                    trainer.vllm_client.close_communicator()
+            except Exception:
+                pass  # Continue if cleanup fails
+
         model_id = "trl-internal-testing/small-Qwen2ForCausalLM-2.5"  # We need a bigger model
         model = AutoModelForCausalLM.from_pretrained(model_id)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -289,10 +303,14 @@ class TestOnlineDPOTrainer(TrlTestCase):
             processing_class=tokenizer,
             reward_processing_classes=self.reward_tokenizer,
         )
-        trainer.train()
 
-        # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        # Ensure cleanup of vLLM communicator after the test
+        try:
+            trainer.train()
+            # Check if training loss is available
+            assert "train_loss" in trainer.state.log_history[-1]
+        finally:
+            cleanup_vllm_communicator(trainer)
 
     @require_vllm
     def test_training_with_vllm_colocate(self):
@@ -329,57 +347,57 @@ class TestOnlineDPOTrainer(TrlTestCase):
         )
 
         # Verify vLLM setup
-        self.assertTrue(trainer.use_vllm)
-        self.assertEqual(trainer.vllm_mode, "colocate")
-        self.assertIsNotNone(trainer.llm)
+        assert trainer.use_vllm
+        assert trainer.vllm_mode == "colocate"
+        assert trainer.llm is not None
         # self.assertIsNone(trainer.vllm_client)
         # self.assertEqual(trainer.vllm_gpu_memory_utilization, 0.2)
 
         # Verify generation parameters
-        self.assertEqual(trainer.temperature, 0.9)
-        self.assertEqual(trainer.top_p, 0.95)
-        self.assertEqual(trainer.top_k, 50)
-        self.assertEqual(trainer.repetition_penalty, 1.1)
+        assert trainer.temperature == 0.9
+        assert trainer.top_p == 0.95
+        assert trainer.top_k == 50
+        assert trainer.repetition_penalty == 1.1
 
         # Verify generation config
-        self.assertIsNotNone(trainer.generation_config)
-        self.assertEqual(trainer.generation_config.temperature, 0.9)
-        self.assertEqual(trainer.generation_config.top_p, 0.95)
-        self.assertEqual(trainer.generation_config.top_k, 50)
-        self.assertEqual(trainer.generation_config.repetition_penalty, 1.1)
-        self.assertEqual(trainer.generation_config.max_tokens, 32)
+        assert trainer.generation_config is not None
+        assert trainer.generation_config.temperature == 0.9
+        assert trainer.generation_config.top_p == 0.95
+        assert trainer.generation_config.top_k == 50
+        assert trainer.generation_config.repetition_penalty == 1.1
+        assert trainer.generation_config.max_tokens == 32
 
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
     def test_vllm_config_validation(self):
         """Test vLLM configuration validation"""
         # Test valid vllm_mode values
         config = OnlineDPOConfig(use_vllm=True, vllm_mode="server")
-        self.assertEqual(config.vllm_mode, "server")
+        assert config.vllm_mode == "server"
 
         config = OnlineDPOConfig(use_vllm=True, vllm_mode="colocate")
-        self.assertEqual(config.vllm_mode, "colocate")
+        assert config.vllm_mode == "colocate"
 
         # Test default values
         config = OnlineDPOConfig()
-        self.assertEqual(config.vllm_mode, "server")
-        self.assertIsNone(config.vllm_server_base_url)
-        self.assertEqual(config.vllm_server_host, "0.0.0.0")
-        self.assertEqual(config.vllm_server_port, 8000)
-        self.assertEqual(config.vllm_server_timeout, 240.0)
-        self.assertEqual(config.vllm_gpu_memory_utilization, 0.55)
+        assert config.vllm_mode == "server"
+        assert config.vllm_server_base_url is None
+        assert config.vllm_server_host == "0.0.0.0"
+        assert config.vllm_server_port == 8000
+        assert config.vllm_server_timeout == 240.0
+        assert config.vllm_gpu_memory_utilization == 0.55
 
         # Test generation parameters
-        self.assertEqual(config.top_p, 1.0)
-        self.assertIsNone(config.top_k)
-        self.assertIsNone(config.min_p)
-        self.assertEqual(config.repetition_penalty, 1.0)
-        self.assertFalse(config.use_transformers_paged)
-        self.assertIsNone(config.cache_implementation)
-        self.assertIsNone(config.generation_kwargs)
+        assert config.top_p == 1.0
+        assert config.top_k is None
+        assert config.min_p is None
+        assert config.repetition_penalty == 1.0
+        assert not config.use_transformers_paged
+        assert config.cache_implementation is None
+        assert config.generation_kwargs is None
 
     def test_generation_config_setup(self):
         """Test that generation configuration is properly set up for both vLLM and transformers"""
@@ -406,21 +424,23 @@ class TestOnlineDPOTrainer(TrlTestCase):
         )
 
         # Verify transformers generation config
-        self.assertFalse(trainer.use_vllm)
+        assert not trainer.use_vllm
         # When not using vLLM, these attributes should not be set
-        self.assertFalse(hasattr(trainer, "llm") and trainer.llm is not None)
-        self.assertFalse(hasattr(trainer, "vllm_client") and trainer.vllm_client is not None)
-        self.assertIsNotNone(trainer.generation_config)
-        self.assertEqual(trainer.generation_config.temperature, 0.8)
-        self.assertEqual(trainer.generation_config.top_p, 0.9)
-        self.assertEqual(trainer.generation_config.top_k, 40)
-        self.assertEqual(trainer.generation_config.repetition_penalty, 1.2)
-        self.assertEqual(trainer.generation_config.max_new_tokens, 64)
-        self.assertFalse(trainer.generation_config.do_sample)  # From generation_kwargs
+        assert not (hasattr(trainer, "llm") and trainer.llm is not None)
+        assert not (hasattr(trainer, "vllm_client") and trainer.vllm_client is not None)
+        assert trainer.generation_config is not None
+        assert trainer.generation_config.temperature == 0.8
+        assert trainer.generation_config.top_p == 0.9
+        assert trainer.generation_config.top_k == 40
+        assert trainer.generation_config.repetition_penalty == 1.2
+        assert trainer.generation_config.max_new_tokens == 64
+        assert not trainer.generation_config.do_sample  # From generation_kwargs
 
+    @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     @require_torch_accelerator
-    @parameterized.expand([("standard_prompt_only",), ("conversational_prompt_only",)])
     def test_training_with_transformers_paged(self, config_name):
+        if Version(transformers.__version__) < Version("4.57.0"):
+            pytest.xfail("Upstream bug in transformers (GH#40692). Fix merged; awaiting release >= 4.57.0")
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -444,9 +464,9 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         # Check if training loss is available
-        self.assertIn("train_loss", trainer.state.log_history[-1])
+        assert "train_loss" in trainer.state.log_history[-1]
 
-    @parameterized.expand([("standard_prompt_only",), ("conversational_prompt_only",)])
+    @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_training_with_reward_funcs(self, config_name):
         def simple_reward_func(prompts, completions, completion_ids, **kwargs):
             return [0.5 for _ in prompts]
@@ -472,20 +492,21 @@ class TestOnlineDPOTrainer(TrlTestCase):
         )
         trainer.train()
 
-        self.assertIn("train_loss", trainer.state.log_history[-1])
-        self.assertEqual(len(trainer.reward_funcs), 2)
-        self.assertIsNotNone(trainer.reward_weights)
-        self.assertAlmostEqual(trainer.reward_weights[0].item(), 0.7, places=5)
-        self.assertAlmostEqual(trainer.reward_weights[1].item(), 0.3, places=5)
+        assert "train_loss" in trainer.state.log_history[-1]
+        assert len(trainer.reward_funcs) == 2
+        assert trainer.reward_weights is not None
+        assert round(abs(trainer.reward_weights[0].item() - 0.7), 5) == 0
+        assert round(abs(trainer.reward_weights[1].item() - 0.3), 5) == 0
 
 
 @require_vision
-class OnlineDPOVisionTrainerTester(TrlTestCase):
-    @parameterized.expand(
+class TestOnlineDPOVisionTrainer(TrlTestCase):
+    @pytest.mark.parametrize(
+        "model_id",
         [
-            ("trl-internal-testing/tiny-Idefics2ForConditionalGeneration",),
-            ("trl-internal-testing/tiny-LlavaForConditionalGeneration",),
-        ]
+            "trl-internal-testing/tiny-Idefics2ForConditionalGeneration",
+            "trl-internal-testing/tiny-LlavaForConditionalGeneration",
+        ],
     )
     def test_online_dpo_vlm_trainer(self, model_id):
         dataset_dict = {
@@ -501,7 +522,7 @@ class OnlineDPOVisionTrainerTester(TrlTestCase):
         dataset = Dataset.from_dict(dataset_dict)
         dataset = dataset.cast_column("images", features.Sequence(features.Image()))
 
-        model = AutoModelForVision2Seq.from_pretrained(model_id)
+        model = AutoModelForImageTextToText.from_pretrained(model_id)
         reward_model = AutoModelForSequenceClassification.from_pretrained(
             "trl-internal-testing/tiny-LlamaForCausalLM-3.2", num_labels=1
         )
@@ -528,4 +549,4 @@ class OnlineDPOVisionTrainerTester(TrlTestCase):
 
         trainer.train()
 
-        self.assertIsNotNone(trainer.state.log_history[-1]["train_loss"])
+        assert trainer.state.log_history[-1]["train_loss"] is not None

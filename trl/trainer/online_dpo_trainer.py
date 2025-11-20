@@ -16,16 +16,18 @@ import os
 import re
 import textwrap
 import warnings
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 import jinja2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
+import transformers
 from accelerate import logging
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset
@@ -43,10 +45,9 @@ from transformers import (
     ProcessorMixin,
     Trainer,
     TrainerCallback,
-    is_apex_available,
-    is_wandb_available,
+    is_bitsandbytes_available,
 )
-from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
+from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
 from transformers.trainer_utils import EvalPrediction, seed_worker
 from transformers.training_args import OptimizerNames
 from transformers.utils import (
@@ -59,28 +60,29 @@ from ..data_utils import apply_chat_template, is_conversational, maybe_apply_cha
 from ..extras.profiling import profiling_context
 from ..extras.vllm_client import VLLMClient
 from ..import_utils import is_vllm_available
-from ..models import create_reference_model, prepare_peft_model
-from ..models.utils import unwrap_model_for_generation
-from .judges import BasePairwiseJudge
+from ..models import (
+    create_reference_model,
+    prepare_deepspeed,
+    prepare_fsdp,
+    prepare_peft_model,
+    unwrap_model_for_generation,
+)
+from .base_trainer import BaseTrainer
 from .online_dpo_config import OnlineDPOConfig
 from .utils import (
     SIMPLE_CHAT_TEMPLATE,
     DPODataCollatorWithPadding,
     disable_dropout_in_model,
     empty_cache,
-    generate_model_card,
-    get_comet_experiment_url,
+    ensure_master_addr_port,
+    get_config_model_id,
     pad,
-    prepare_deepspeed,
     truncate_right,
 )
 
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel
-
-if is_apex_available():
-    from apex import amp
 
 
 if is_sagemaker_mp_enabled():
@@ -96,22 +98,22 @@ if is_vllm_available():
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import GuidedDecodingParams
 
-if is_wandb_available():
-    import wandb
+if is_bitsandbytes_available():
+    import bitsandbytes as bnb
 
 logger = logging.get_logger(__name__)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
-RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 
 
-class OnlineDPOTrainer(Trainer):
+class OnlineDPOTrainer(BaseTrainer):
     r"""
     Initialize OnlineDPOTrainer.
 
     Args:
-        model (`Union[str, nn.Module, PreTrainedModel]`):
+        model (`str | nn.Module | PreTrainedModel`):
             Model to be trained. Can be either:
 
             - A string, being the *model id* of a pretrained model hosted inside a model repo on huggingface.co, or a
@@ -120,12 +122,12 @@ class OnlineDPOTrainer(Trainer):
               using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keyword arguments in
               `args.model_init_kwargs`.
             - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
-        ref_model (`transformers.PreTrainedModel` or `torch.nn.Module` or `None`):
+        ref_model ([`~transformers.PreTrainedModel`] or `torch.nn.Module` or `None`):
             The reference model to use for training. If None is specified, the reference model will be created from the
             model.
-        judge (`BasePairwiseJudge`):
+        judge ([`experimental.judges.BasePairwiseJudge`]):
             The judge to use for pairwise comparison of model completions.
-        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`, *optional*, defaults to `None`):
+        reward_funcs (`RewardFunc | list[RewardFunc]`, *optional*):
             Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
             functions with the prompts and completions and sum the rewards. Can be either:
 
@@ -134,21 +136,21 @@ class OnlineDPOTrainer(Trainer):
             - A list of reward functions: Must all be of compatible types.
 
             Note: Only one of `judge`, or `reward_funcs` should be provided.
-        args (`OnlineDPOConfig`):
+        args ([`OnlineDPOConfig`]):
             The online DPO config arguments to use for training.
-        data_collator (`transformers.DataCollator`):
+        data_collator ([`~transformers.DataCollator`]):
             The data collator to use for training. If None is specified, the default data collator
-            (`DPODataCollatorWithPadding`) will be used which will pad the sequences to the maximum length of the
+            ([`DPODataCollatorWithPadding`]) will be used which will pad the sequences to the maximum length of the
             sequences in the batch, given a dataset of paired sequences.
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
             The dataset to use for training.
-        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
+        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Dataset | IterableDataset]`):
             The dataset to use for evaluation.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`] or [`~transformers.ProcessorMixin`], *optional*, defaults to `None`):
+        processing_class ([`~transformers.PreTrainedTokenizerBase`] or [`~transformers.ProcessorMixin`], *optional*):
             Processing class used to process the data. If provided, will be used to automatically process the inputs
             for the model, and it will be saved along the model to make it easier to rerun an interrupted training or
             reuse the fine-tuned model.
-        reward_processing_classes (`Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]`, *optional*, defaults to `None`):
+        reward_processing_classes ([`~transformers.PreTrainedTokenizerBase`] or `list[PreTrainedTokenizerBase]`, *optional*):
             Processing classes corresponding to the reward functions specified in `reward_funcs`. Can be either:
 
             - A single processing class: Used when `reward_funcs` contains only one reward function.
@@ -156,7 +158,7 @@ class OnlineDPOTrainer(Trainer):
 
             If set to `None`, the tokenizer for each model-based reward function is automatically loaded using
             [`~transformers.AutoTokenizer.from_pretrained`].
-        peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
+        peft_config ([`~peft.PeftConfig`], *optional*):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
         compute_metrics (`Callable[[EvalPrediction], dict]`, *optional*):
             The function to use to compute the metrics. Must take a `EvalPrediction` and return a dictionary string to
@@ -167,38 +169,48 @@ class OnlineDPOTrainer(Trainer):
             The optimizer and scheduler to use for training.
         preprocess_logits_for_metrics (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`):
             The function to use to preprocess the logits before computing the metrics.
-
-    .. deprecated:: 0.22.0
-        The following parameters are deprecated and will be removed in a future version:
-
-        * `reward_model`: Use `reward_funcs` instead. For example, change `reward_model=model` to `reward_funcs=model`.
-        * `reward_processing_class`: Use `reward_processing_classes` instead. For example, change
-          `reward_processing_class=tokenizer` to `reward_processing_classes=tokenizer`.
     """
 
     _tag_names = ["trl", "online-dpo"]
+    _name = "Online DPO"
+    _paper = {
+        "title": "Direct Language Model Alignment from Online AI Feedback",
+        "id": "2402.04792",
+        # docstyle-ignore
+        "citation": textwrap.dedent("""\
+            @article{guo2024direct,
+                title        = {{Direct Language Model Alignment from Online AI Feedback}},
+                author       = {Shangmin Guo and Biao Zhang and Tianlin Liu and Tianqi Liu and Misha Khalman and Felipe Llinares and Alexandre Ram{\'{e}} and Thomas Mesnard and Yao Zhao and Bilal Piot and Johan Ferret and Mathieu Blondel},
+                year         = 2024,
+                eprint       = {arXiv:2402.04792}
+            }"""),
+    }
 
     def __init__(
         self,
-        model: Union[PreTrainedModel, nn.Module, str],
-        ref_model: Union[PreTrainedModel, nn.Module, None] = None,
-        reward_funcs: Optional[Union[RewardFunc, list[RewardFunc]]] = None,
-        judge: Optional[BasePairwiseJudge] = None,
-        args: Optional[OnlineDPOConfig] = None,
-        data_collator: Optional[DataCollator] = None,
-        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
-        processing_class: Optional[Union[PreTrainedTokenizerBase, ProcessorMixin]] = None,
-        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
-        peft_config: Optional["PeftConfig"] = None,
-        compute_metrics: Optional[Callable[[EvalPrediction], dict]] = None,
-        callbacks: Optional[list[TrainerCallback]] = None,
+        model: PreTrainedModel | nn.Module | str,
+        ref_model: PreTrainedModel | nn.Module | None = None,
+        reward_funcs: RewardFunc | list[RewardFunc] | None = None,
+        judge=None,
+        args: OnlineDPOConfig | None = None,
+        data_collator: DataCollator | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
+        processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+        reward_processing_classes: PreTrainedTokenizerBase | list[PreTrainedTokenizerBase] | None = None,
+        peft_config: "PeftConfig | None" = None,
+        compute_metrics: Callable[[EvalPrediction], dict] | None = None,
+        callbacks: list[TrainerCallback] | None = None,
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-        preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
-        # Deprecated parameters
-        reward_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
-        reward_processing_class: Optional[PreTrainedTokenizerBase] = None,
+        preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        if not os.environ.get("TRL_EXPERIMENTAL_SILENCE"):
+            warnings.warn(
+                "This trainer will soon be moved to trl.experimental and is a candidate for removal. If you rely on "
+                "it and want it to remain, please share your comments here: "
+                "https://github.com/huggingface/trl/issues/4223. Silence this warning by setting environment variable "
+                "TRL_EXPERIMENTAL_SILENCE=1."
+            )
         if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
@@ -206,36 +218,6 @@ class OnlineDPOTrainer(Trainer):
             )
 
         self.ref_model = ref_model
-
-        # Handle deprecated parameters for backward compatibility
-        if reward_model is not None:
-            warnings.warn(
-                "The `reward_model` parameter is deprecated and will be removed in version 0.25.0. "
-                "Please use `reward_funcs` instead. For example, change `reward_model=model` to `reward_funcs=model`.",
-            )
-            # Convert old reward_model to new reward_funcs format
-            if reward_funcs is None:
-                reward_funcs = reward_model
-            else:
-                warnings.warn(
-                    "Both `reward_model` and `reward_funcs` are provided. Using `reward_funcs` and ignoring "
-                    "`reward_model`.",
-                )
-
-        if reward_processing_class is not None:
-            warnings.warn(
-                "The `reward_processing_class` parameter is deprecated and will be removed in version 0.25.0. "
-                "Please use `reward_processing_classes` instead. For example, change "
-                "`reward_processing_class=tokenizer` to `reward_processing_classes=tokenizer`.",
-            )
-            # Convert old reward_processing_class to new reward_processing_classes format
-            if reward_processing_classes is None:
-                reward_processing_classes = reward_processing_class
-            else:
-                warnings.warn(
-                    "Both `reward_processing_class` and `reward_processing_classes` are provided. Using "
-                    "`reward_processing_classes` and ignoring `reward_processing_class`.",
-                )
 
         # Validate reward configuration - must have exactly one of: judge, or reward_funcs
         reward_configs = sum(x is not None for x in [judge, reward_funcs])
@@ -265,7 +247,7 @@ class OnlineDPOTrainer(Trainer):
                         reward_func, num_labels=1, **model_init_kwargs
                     )
                 if isinstance(reward_funcs[i], nn.Module):
-                    self.reward_func_names.append(reward_funcs[i].config._name_or_path.split("/")[-1])
+                    self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
                 else:
                     self.reward_func_names.append(reward_funcs[i].__name__)
             self.reward_funcs = reward_funcs
@@ -282,7 +264,7 @@ class OnlineDPOTrainer(Trainer):
                     )
 
             self.reward_processing_classes = []
-            for reward_processing_class_i, reward_func in zip(reward_processing_classes, reward_funcs):
+            for reward_processing_class_i, reward_func in zip(reward_processing_classes, reward_funcs, strict=True):
                 if isinstance(reward_func, PreTrainedModel):
                     if reward_processing_class_i is None:
                         reward_processing_class_i = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
@@ -311,16 +293,7 @@ class OnlineDPOTrainer(Trainer):
             self.reward_weights = None
 
         if args.missing_eos_penalty is not None and reward_funcs is None and judge is None:
-            # Check if this is the old reward_model case
-            if reward_model is not None:
-                logger.warning(
-                    "The `missing_eos_penalty` parameter is deprecated when used with the deprecated `reward_model` parameter. "
-                    "Please use `reward_funcs` instead of `reward_model` to continue using this feature.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            else:
-                raise ValueError("`missing_eos_penalty` is only supported when `reward_funcs` is provided.")
+            raise ValueError("`missing_eos_penalty` is only supported when `reward_funcs` is provided.")
 
         if args is None:
             raise ValueError("`args` must be provided.")
@@ -334,7 +307,7 @@ class OnlineDPOTrainer(Trainer):
             model_id = model
 
             # Handle dtype in model_init_kwargs
-            dtype = model_init_kwargs.get("dtype")
+            dtype = model_init_kwargs.get("dtype", "auto")
             if isinstance(dtype, torch.dtype) or dtype == "auto" or dtype is None:
                 pass
             elif isinstance(dtype, str):
@@ -345,6 +318,7 @@ class OnlineDPOTrainer(Trainer):
                     "Invalid `dtype` passed to `OnlineDPOConfig`. Expected either 'auto' or a string "
                     f"representing a `torch.dtype` (e.g., 'float32'), but got {dtype}."
                 )
+            model_init_kwargs["device_map"] = model_init_kwargs.get("device_map", "auto")
 
             model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         else:
@@ -354,7 +328,7 @@ class OnlineDPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
         self.is_encoder_decoder = model.config.is_encoder_decoder
-        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+        self.is_vision_model = model.config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.keys()
 
         if peft_config is not None or (is_peft_available() and isinstance(model, PeftModel)):
             model = prepare_peft_model(model, peft_config, args)
@@ -482,7 +456,7 @@ class OnlineDPOTrainer(Trainer):
             if not is_vllm_available():
                 raise ImportError(
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
-                    "`pip install vllm` to use it."
+                    "`pip install trl[vllm]` to use it."
                 )
 
             if self.vllm_mode == "server":
@@ -492,7 +466,11 @@ class OnlineDPOTrainer(Trainer):
                     else:
                         base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
                     self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
-                    self.vllm_client.init_communicator(device=torch.cuda.current_device())
+
+                    # Determine device type (supports cuda, xpu, etc.)
+                    accelerator_type = torch.accelerator.current_accelerator().type
+                    current_device = getattr(torch, accelerator_type).current_device()
+                    self.vllm_client.init_communicator(device=current_device)
                 else:
                     self.vllm_client = None
             elif self.vllm_mode == "colocate":
@@ -502,6 +480,14 @@ class OnlineDPOTrainer(Trainer):
                 # after the first optimizer step and remain in GPU memory throughout training. So we must reserve enough
                 # space for them.
                 # Configure vLLM parameters
+                vllm_quantization = None
+                if is_bitsandbytes_available():
+                    for _, module in model.named_modules():
+                        if isinstance(module, bnb.nn.Linear4bit):
+                            vllm_quantization = "bitsandbytes"
+                            break
+                        elif isinstance(module, bnb.nn.Linear8bitLt):
+                            raise ValueError("vLLM does not support in-flight 8-bit quantization.")
                 vllm_kwargs = {
                     "model": model.name_or_path,
                     "tensor_parallel_size": self.vllm_tensor_parallel_size,
@@ -514,14 +500,15 @@ class OnlineDPOTrainer(Trainer):
                     "seed": self.accelerator.process_index // self.vllm_tensor_parallel_size,
                     # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768)
                     "max_num_batched_tokens": 4096,
+                    "quantization": vllm_quantization,
                 }
 
                 # vLLM requires the environment variables to be set for distributed training.
                 os.environ["RANK"] = str(self.accelerator.process_index)
                 os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
                 os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
-                os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-                os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
+                # Ensure distributed rendezvous variables are set without colliding across concurrent runs
+                ensure_master_addr_port()
 
                 self.llm = LLM(**vllm_kwargs)
             else:
@@ -570,32 +557,24 @@ class OnlineDPOTrainer(Trainer):
                 generation_kwargs["min_p"] = self.min_p
             if args.generation_kwargs is not None:
                 generation_kwargs.update(args.generation_kwargs)
-            if self.use_transformers_paged:
-                generation_kwargs["max_batch_tokens"] = 512
-                generation_kwargs["num_blocks"] = 1024
-                generation_kwargs["block_size"] = 128
             # Remove None values
             generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
             self.generation_config = GenerationConfig(**generation_kwargs)
 
-        if self.is_deepspeed_enabled:
-            if self.ref_model is not None:
-                self.ref_model = prepare_deepspeed(
-                    self.ref_model, args.per_device_train_batch_size, args.fp16, args.bf16
-                )
-            # Prepare reward function models for DeepSpeed
-            if self.reward_funcs is not None:
-                for i, reward_func in enumerate(self.reward_funcs):
-                    if isinstance(reward_func, PreTrainedModel):
+        if self.ref_model is not None:
+            if self.is_deepspeed_enabled:
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+        if self.reward_funcs is not None:
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, PreTrainedModel):
+                    if self.is_deepspeed_enabled:
                         self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
-        else:
-            if self.ref_model is not None:
-                self.ref_model = self.ref_model.to(self.accelerator.device)
-            # Prepare reward function models for FSDP/regular training
-            if self.reward_funcs is not None:
-                for i, reward_func in enumerate(self.reward_funcs):
-                    if isinstance(reward_func, PreTrainedModel):
-                        # Set device placement to True to make `prepare_model` move `reward_func` to device when using fsdp
+                    else:
+                        # set device placement to True to make `prepare_model` move `reward_func` to device when using fsdp
                         self.reward_funcs[i] = self.accelerator.prepare_model(
                             reward_func, evaluation_mode=True, device_placement=True
                         )
@@ -650,7 +629,7 @@ class OnlineDPOTrainer(Trainer):
 
     # Same as Trainer.get_eval_dataloader but skip the "remove_unused_columns".
     @wraps(Trainer.get_eval_dataloader)
-    def get_eval_dataloader(self, eval_dataset: Optional[Union[str, Dataset]] = None) -> DataLoader:
+    def get_eval_dataloader(self, eval_dataset: str | Dataset | None = None) -> DataLoader:
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
@@ -792,7 +771,7 @@ class OnlineDPOTrainer(Trainer):
                 max_tokens=self.generation_config.max_tokens,
                 guided_decoding_regex=self.guided_decoding_regex if hasattr(self, "guided_decoding_regex") else None,
                 generation_kwargs=self.args.generation_kwargs,
-            )
+            )["completion_ids"]
             # Flatten: each prompt generates 2 completions
             completion_ids = [[comp_id] for prompt_completions in completion_ids for comp_id in prompt_completions]
         else:
@@ -823,8 +802,10 @@ class OnlineDPOTrainer(Trainer):
 
     def _generate_vllm_colocate(self, prompts, images=None):
         """Generate completions using vLLM colocate mode"""
-        # Update model weights if needed
-        self._move_model_to_vllm()
+        # Update model weights if needed - only after gradient accumulation completes
+        if self.state.global_step != self._last_loaded_step:
+            self._move_model_to_vllm()
+            self._last_loaded_step = self.state.global_step
 
         # Apply chat template if conversational
         if is_conversational({"prompt": prompts[0]}):
@@ -835,7 +816,7 @@ class OnlineDPOTrainer(Trainer):
         # Prepare vLLM inputs with images if available
         if images is not None:
             vllm_inputs = []
-            for prompt, image in zip(prompts_text, images):
+            for prompt, image in zip(prompts_text, images, strict=True):
                 if image is not None:
                     vllm_inputs.append({"prompt": prompt, "multi_modal_data": {"image": image}})
                 else:
@@ -965,7 +946,7 @@ class OnlineDPOTrainer(Trainer):
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
 
-    def _fix_param_name_to_vllm(self, name, extra_prefixes: Optional[list[str]] = None):
+    def _fix_param_name_to_vllm(self, name, extra_prefixes: list[str] | None = None):
         """Clean parameter names for vLLM compatibility"""
         extra_prefixes = extra_prefixes or []
         prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
@@ -974,7 +955,7 @@ class OnlineDPOTrainer(Trainer):
         return name
 
     def process_vision_row(
-        self, features: dict[str, Union[list, torch.Tensor]], processing_class=None
+        self, features: dict[str, list | torch.Tensor], processing_class=None
     ) -> dict[str, list[int]]:
         """
         Process a vision row for VLM models (adapted from DPO trainer)
@@ -1087,10 +1068,11 @@ class OnlineDPOTrainer(Trainer):
         if self.use_transformers_paged:
             previous_attn = self.model_wrapped.config._attn_implementation
 
-            if is_flash_attn_2_available():
-                self.model_wrapped.config._attn_implementation = "paged_attention"
+            if version.parse(transformers.__version__).release >= version.parse("5.0.0").release:
+                new_attn = "paged|flash_attention_2" if is_flash_attn_2_available() else "paged|sdpa"
             else:
-                self.model_wrapped.config._attn_implementation = "sdpa_paged"
+                new_attn = "paged_attention" if is_flash_attn_2_available() else "sdpa_paged"
+            self.model_wrapped.config._attn_implementation = new_attn
             with (
                 profiling_context(self, "transformers.generate_batch"),
                 unwrap_model_for_generation(
@@ -1110,6 +1092,7 @@ class OnlineDPOTrainer(Trainer):
                         generation_config=self.generation_config,
                         progress_bar=False,
                     )
+                    unwrapped_model.train()  # restore training mode, as generate_batch forces eval mode
             completion_ids = [output.generated_tokens for output in all_outputs.values()]
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
@@ -1161,15 +1144,15 @@ class OnlineDPOTrainer(Trainer):
         reward_kwargs["trainer_state"] = self.state
 
         for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
+            zip(self.reward_funcs, self.reward_processing_classes, strict=True)
         ):
             if isinstance(reward_func, nn.Module):  # Model-based reward function
                 # Handle conversational vs text input
                 if is_conversational({"prompt": prompts[0]}):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions, strict=True)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
+                    texts = [p + c for p, c in zip(prompts, completions, strict=True)]
 
                 # Tokenize and get reward scores
                 reward_inputs = reward_processing_class(
@@ -1223,17 +1206,19 @@ class OnlineDPOTrainer(Trainer):
         # Get the logprobs of the completions from the model
         output = model(prompt_completion_ids, **model_kwargs)
 
-        # There is 1 offset, because the model predict the next token
+        # There is 1 offset, because the model predicts the next token
         prompt_len = prompt_ids.size(1)
         start_idx = prompt_len - 1 if prompt_len > 0 else 0
-        logits = output.logits[:, start_idx:-1]
+        # Only slice off the last logit when we have a prompt, otherwise we need all logits
+        end_idx = -1 if prompt_len > 0 else None
+        logits = output.logits[:, start_idx:end_idx]
 
         # Take the completion tokens logprob
         logprobs = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
         return logprobs
 
     def training_step(
-        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int] = None
+        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
         model.train()
 
@@ -1315,7 +1300,7 @@ class OnlineDPOTrainer(Trainer):
         if is_conversational({"prompt": prompts[0]}):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
-        # Get the reward from reward functions, judge, or deprecated reward_model
+        # Get the reward from reward functions or judge
         if self.reward_funcs is not None:
             # First create completion_ids_list for custom reward functions
             completion_ids_list = [completion_ids[i].tolist() for i in range(completion_ids.shape[0])]
@@ -1354,7 +1339,7 @@ class OnlineDPOTrainer(Trainer):
                 completions = [template.render(messages=completion) for completion in completions]
 
             ranks_of_first_completion = self.judge.judge(
-                prompts, list(zip(completions[:batch_size], completions[batch_size:]))
+                prompts, list(zip(completions[:batch_size], completions[batch_size:], strict=True))
             )
 
             # convert ranks to a True/False mask:
@@ -1449,11 +1434,7 @@ class OnlineDPOTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        if self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            self.accelerator.backward(loss, **kwargs)
+        self.accelerator.backward(loss, **kwargs)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
@@ -1508,68 +1489,3 @@ class OnlineDPOTrainer(Trainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
-
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        if "JOB_ID" in os.environ:
-            tags.add("hf_jobs")
-
-        tags.update(self._tag_names)
-
-        # docstyle-ignore
-        citation = textwrap.dedent("""\
-        @article{guo2024direct,
-            title        = {{Direct Language Model Alignment from Online AI Feedback}},
-            author       = {Shangmin Guo and Biao Zhang and Tianlin Liu and Tianqi Liu and Misha Khalman and Felipe Llinares and Alexandre Ram{\'{e}} and Thomas Mesnard and Yao Zhao and Bilal Piot and Johan Ferret and Mathieu Blondel},
-            year         = 2024,
-            eprint       = {arXiv:2402.04792}
-        }""")
-
-        model_card = generate_model_card(
-            base_model=base_model,
-            model_name=model_name,
-            hub_model_id=self.hub_model_id,
-            dataset_name=dataset_name,
-            tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
-            comet_url=get_comet_experiment_url(),
-            trainer_name="Online DPO",
-            trainer_citation=citation,
-            paper_title="Direct Language Model Alignment from Online AI Feedback",
-            paper_id="2402.04792",
-        )
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))

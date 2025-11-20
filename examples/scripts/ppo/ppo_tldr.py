@@ -14,7 +14,7 @@
 
 # /// script
 # dependencies = [
-#     "trl @ git+https://github.com/huggingface/trl.git",
+#     "trl",
 #     "peft",
 #     "trackio",
 #     "kernels",
@@ -34,16 +34,8 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl import (
-    ModelConfig,
-    PPOConfig,
-    PPOTrainer,
-    ScriptArguments,
-    get_kbit_device_map,
-    get_peft_config,
-    get_quantization_config,
-)
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
+from trl.experimental.ppo import PPOConfig, PPOTrainer
 
 
 # Enable logging in a Hugging Face Space
@@ -98,21 +90,21 @@ if __name__ == "__main__":
     # Model & Tokenizer
     ################
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
-    quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
         dtype=dtype,
-        device_map=get_kbit_device_map() if quantization_config is not None else None,
-        quantization_config=quantization_config,
     )
+    quantization_config = get_quantization_config(model_args)
+    if quantization_config is not None:
+        # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
+        model_kwargs["device_map"] = get_kbit_device_map()
+        model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    if tokenizer.chat_template is None:
-        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
     )

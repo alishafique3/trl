@@ -16,10 +16,12 @@ import inspect
 import os
 import random
 import textwrap
+import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Union
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -38,7 +40,6 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     ProcessorMixin,
-    Trainer,
     is_comet_available,
     is_torch_xla_available,
     is_wandb_available,
@@ -48,14 +49,13 @@ from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available, is_torch_fx_proxy
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
+from .base_trainer import BaseTrainer
 from .orpo_config import ORPOConfig
 from .utils import (
     DPODataCollatorWithPadding,
     add_bos_token_if_needed,
     add_eos_token_if_needed,
     disable_dropout_in_model,
-    generate_model_card,
-    get_comet_experiment_url,
     log_table_to_comet_experiment,
     pad_to_length,
     peft_module_casting_to_bf16,
@@ -77,24 +77,24 @@ if is_torch_xla_available():
 logger = logging.get_logger(__name__)
 
 
-class ORPOTrainer(Trainer):
+class ORPOTrainer(BaseTrainer):
     r"""
     Initialize ORPOTrainer.
 
     Args:
-        model (`transformers.PreTrainedModel`):
-            The model to train, preferably an `AutoModelForSequenceClassification`.
-        args (`ORPOConfig`):
+        model ([`~transformers.PreTrainedModel`]):
+            The model to train, preferably an [`~transformers.AutoModelForSequenceClassification`].
+        args ([`ORPOConfig`]):
             The ORPO config arguments to use for training.
-        data_collator (`transformers.DataCollator`):
+        data_collator ([`~transformers.DataCollator`]):
             The data collator to use for training. If None is specified, the default data collator
-            (`DPODataCollatorWithPadding`) will be used which will pad the sequences to the maximum length of the
+            ([`DPODataCollatorWithPadding`]) will be used which will pad the sequences to the maximum length of the
             sequences in the batch, given a dataset of paired sequences.
-        train_dataset (`datasets.Dataset`):
+        train_dataset ([`~datasets.Dataset`]):
             The dataset to use for training.
-        eval_dataset (`datasets.Dataset`):
+        eval_dataset ([`~datasets.Dataset`]):
             The dataset to use for evaluation.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*, defaults to `None`):
+        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*):
             Processing class used to process the data. If provided, will be used to automatically process the inputs
             for the model, and it will be saved along the model to make it easier to rerun an interrupted training or
             reuse the fine-tuned model.
@@ -116,31 +116,53 @@ class ORPOTrainer(Trainer):
     """
 
     _tag_names = ["trl", "orpo"]
+    _name = "ORPO"
+    _paper = {
+        "title": "ORPO: Monolithic Preference Optimization without Reference Model",
+        "id": "2403.07691",
+        # docstyle-ignore
+        "citation": textwrap.dedent("""\
+            @article{hong2024orpo,
+                title        = {{ORPO: Monolithic Preference Optimization without Reference Model}},
+                author       = {Jiwoo Hong and Noah Lee and James Thorne},
+                year         = 2024,
+                eprint       = {arXiv:2403.07691}
+            }"""),
+    }
 
     def __init__(
         self,
-        model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
-        args: Optional[ORPOConfig] = None,
-        data_collator: Optional[DataCollator] = None,
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
-        processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
-        ] = None,
-        model_init: Optional[Callable[[], PreTrainedModel]] = None,
-        callbacks: Optional[list[TrainerCallback]] = None,
+        model: PreTrainedModel | nn.Module | str | None = None,
+        args: ORPOConfig | None = None,
+        data_collator: DataCollator | None = None,
+        train_dataset: Dataset | None = None,
+        eval_dataset: Dataset | dict[str, Dataset] | None = None,
+        processing_class: PreTrainedTokenizerBase
+        | BaseImageProcessor
+        | FeatureExtractionMixin
+        | ProcessorMixin
+        | None = None,
+        model_init: Callable[[], PreTrainedModel] | None = None,
+        callbacks: list[TrainerCallback] | None = None,
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-        preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
-        peft_config: Optional[dict] = None,
-        compute_metrics: Optional[Callable[[EvalLoopOutput], dict]] = None,
+        preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        peft_config: dict | None = None,
+        compute_metrics: Callable[[EvalLoopOutput], dict] | None = None,
     ):
+        if not os.environ.get("TRL_EXPERIMENTAL_SILENCE"):
+            warnings.warn(
+                "This trainer will soon be moved to trl.experimental and is a candidate for removal. If you rely on "
+                "it and want it to remain, please share your comments here: "
+                "https://github.com/huggingface/trl/issues/4223. Silence this warning by setting environment variable "
+                "TRL_EXPERIMENTAL_SILENCE=1."
+            )
         if args.model_init_kwargs is None:
             model_init_kwargs = {}
         elif not isinstance(model, str):
             raise ValueError("You passed model_kwargs to the ORPOTrainer. But your model is already instantiated.")
         else:
             model_init_kwargs = args.model_init_kwargs
-            dtype = model_init_kwargs.get("dtype")
+            dtype = model_init_kwargs.get("dtype", "auto")
             if dtype is not None:
                 # Convert to `torch.dtype` if an str is passed
                 if isinstance(dtype, str) and dtype != "auto":
@@ -150,6 +172,7 @@ class ORPOTrainer(Trainer):
                         f"Invalid `dtype` passed to the ORPOConfig. Expected a string with either `torch.dtype` or 'auto', but got {dtype}."
                     )
                 model_init_kwargs["dtype"] = dtype
+            model_init_kwargs["device_map"] = model_init_kwargs.get("device_map", "auto")
 
         if isinstance(model, str):
             model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
@@ -405,7 +428,7 @@ class ORPOTrainer(Trainer):
             attention_mask=answer_attention_mask,
         )
 
-    def tokenize_row(self, feature, model: Optional[Union[PreTrainedModel, nn.Module]] = None) -> dict:
+    def tokenize_row(self, feature, model: PreTrainedModel | nn.Module | None = None) -> dict:
         """Tokenize a single row from a ORPO specific dataset.
 
         At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation in case the prompt +
@@ -453,7 +476,8 @@ class ORPOTrainer(Trainer):
             # Make sure prompts only have one different token at most an
             # and length only differs by 1 at most
             num_diff_tokens = sum(
-                [a != b for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"])]
+                a != b
+                for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"], strict=True)
             )
             num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
             if num_diff_tokens > 1 or num_diff_len > 1:
@@ -562,11 +586,11 @@ class ORPOTrainer(Trainer):
 
     @staticmethod
     def concatenated_inputs(
-        batch: dict[str, Union[list, torch.LongTensor]],
+        batch: dict[str, list | torch.LongTensor],
         is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
         padding_value: int = 0,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> dict[str, torch.LongTensor]:
         """Concatenate the chosen and rejected inputs into a single tensor.
 
@@ -704,7 +728,7 @@ class ORPOTrainer(Trainer):
             return (per_token_logps * loss_mask).sum(-1)
 
     def concatenated_forward(
-        self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]
+        self, model: nn.Module, batch: dict[str, list | torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
@@ -787,7 +811,7 @@ class ORPOTrainer(Trainer):
     def get_batch_loss_metrics(
         self,
         model,
-        batch: dict[str, Union[list, torch.LongTensor]],
+        batch: dict[str, list | torch.LongTensor],
         train_eval: Literal["train", "eval"] = "train",
     ):
         """Compute the ORPO loss and other metrics for the given batch of inputs for train or test."""
@@ -841,11 +865,11 @@ class ORPOTrainer(Trainer):
 
     def compute_loss(
         self,
-        model: Union[PreTrainedModel, nn.Module],
-        inputs: dict[str, Union[torch.Tensor, Any]],
+        model: PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
         return_outputs=False,
         num_items_in_batch=None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         compute_loss_context_manager = (
             autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
         )
@@ -888,10 +912,10 @@ class ORPOTrainer(Trainer):
 
     def prediction_step(
         self,
-        model: Union[PreTrainedModel, nn.Module],
-        inputs: dict[str, Union[torch.Tensor, Any]],
+        model: PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
         prediction_loss_only: bool,
-        ignore_keys: Optional[list[str]] = None,
+        ignore_keys: list[str] | None = None,
     ):
         if not self.use_dpo_data_collator:
             logger.warning(
@@ -936,8 +960,8 @@ class ORPOTrainer(Trainer):
         self,
         dataloader: DataLoader,
         description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[list[str]] = None,
+        prediction_loss_only: bool | None = None,
+        ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
         """
@@ -963,7 +987,8 @@ class ORPOTrainer(Trainer):
             table = pd.DataFrame(
                 columns=["Prompt", "Policy"],
                 data=[
-                    [prompt, pol[len(prompt) :]] for prompt, pol in zip(random_batch["prompt"], policy_output_decoded)
+                    [prompt, pol[len(prompt) :]]
+                    for prompt, pol in zip(random_batch["prompt"], policy_output_decoded, strict=True)
                 ],
             )
             if "wandb" in self.args.report_to:
@@ -982,14 +1007,14 @@ class ORPOTrainer(Trainer):
 
         return initial_output
 
-    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
         Args:
             logs (`dict[str, float]`):
                 The values to log.
-            start_time (`float` or `None`, *optional*, defaults to `None`):
+            start_time (`float`, *optional*):
                 Start time of the training.
         """
         # logs either has 'loss' or 'eval_loss'
@@ -1031,69 +1056,3 @@ class ORPOTrainer(Trainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
-
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        if "JOB_ID" in os.environ:
-            tags.add("hf_jobs")
-
-        tags.update(self._tag_names)
-
-        # docstyle-ignore
-        citation = textwrap.dedent("""\
-        @article{hong2024orpo,
-            title        = {{ORPO: Monolithic Preference Optimization without Reference Model}},
-            author       = {Jiwoo Hong and Noah Lee and James Thorne},
-            year         = 2024,
-            eprint       = {arXiv:2403.07691}
-        }""")
-
-        model_card = generate_model_card(
-            base_model=base_model,
-            model_name=model_name,
-            hub_model_id=self.hub_model_id,
-            dataset_name=dataset_name,
-            tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
-            comet_url=get_comet_experiment_url(),
-            trainer_name="ORPO",
-            trainer_citation=citation,
-            paper_title="ORPO: Monolithic Preference Optimization without Reference Model",
-            paper_id="2403.07691",
-        )
-
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))

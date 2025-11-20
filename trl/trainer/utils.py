@@ -15,27 +15,34 @@
 import dataclasses
 import importlib.resources as pkg_resources
 import json
+import os
 import random
-from collections import deque
-from collections.abc import Sequence, Sized
+import socket
+import warnings
+from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass, field
 from importlib.metadata import version
-from typing import Any, Literal, Optional, Union
+from itertools import accumulate
+from typing import Any, Literal, TypeVar
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import torch.utils.data
+import transformers
 from accelerate import Accelerator, PartialState, logging
 from accelerate.state import AcceleratorState
 from huggingface_hub import ModelCard, ModelCardData
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Sampler
 from transformers import (
+    AutoConfig,
     BitsAndBytesConfig,
     EvalPrediction,
     GenerationConfig,
+    PretrainedConfig,
+    PreTrainedModel,
     PreTrainedTokenizerBase,
     TrainerState,
     TrainingArguments,
@@ -108,41 +115,76 @@ class DataCollatorForChatML:
                 formatted_message = self.tokenizer.apply_chat_template(
                     message, tokenize=False, add_generation_prompt=False
                 )
+
                 tokenized_message = self.tokenizer(
                     formatted_message,
+                    truncation=False,
+                    padding=False,
+                    return_tensors=None,
+                    add_special_tokens=False,
+                    return_offsets_mapping=True,
+                )
+                message_input_ids_full = tokenized_message["input_ids"]
+                offsets = tokenized_message.get("offset_mapping")
+
+                if offsets is not None:
+                    prompt_char_len = len(formatted_prompt)
+                    completion_start_idx_full = next(
+                        (idx for idx, (start, _) in enumerate(offsets) if start >= prompt_char_len),
+                        len(message_input_ids_full),
+                    )
+                else:
+                    tokenized_prompt_full = self.tokenizer(
+                        formatted_prompt,
+                        truncation=False,
+                        padding=False,
+                        return_tensors=None,
+                        add_special_tokens=False,
+                    )
+                    completion_start_idx_full = len(tokenized_prompt_full["input_ids"])
+
+                prompt_tokens_full = message_input_ids_full[:completion_start_idx_full]
+                completion_input_ids_full = message_input_ids_full[completion_start_idx_full:]
+
+                if self.max_length is not None and len(message_input_ids_full) > self.max_length:
+                    completion_ids = completion_input_ids_full
+                    if len(completion_ids) >= self.max_length:
+                        completion_ids = completion_ids[-self.max_length :]
+                        prompt_ids = []
+                    else:
+                        max_prompt_tokens = self.max_length - len(completion_ids)
+                        prompt_ids = prompt_tokens_full[-max_prompt_tokens:] if max_prompt_tokens > 0 else []
+                    message_input_ids = prompt_ids + completion_ids
+                else:
+                    message_input_ids = message_input_ids_full
+                    prompt_ids = prompt_tokens_full
+
+                input_ids.append(message_input_ids)
+                attention_mask.append([1] * len(message_input_ids))
+                current_prompt_ids = prompt_ids
+            else:
+                message_input_ids = example["input_ids"]
+                input_ids.append(message_input_ids)
+                if "attention_mask" in example:
+                    attention_mask.append(example["attention_mask"])
+                else:
+                    attention_mask.append([1] * len(message_input_ids))
+
+                tokenized_prompt = self.tokenizer(
+                    formatted_prompt,
                     truncation=True,
-                    max_length=self.max_length,
+                    max_length=len(message_input_ids),
                     padding=False,
                     return_tensors=None,
                     add_special_tokens=False,
                 )
-                input_ids.append(tokenized_message["input_ids"])
-                if "attention_mask" in example:
-                    attention_mask.append(tokenized_message["attention_mask"])
-                else:
-                    attention_mask.append([1] * len(tokenized_message["input_ids"]))
-            else:
-                input_ids.append(example["input_ids"])
-                if "attention_mask" in example:
-                    attention_mask.append(example["attention_mask"])
-                else:
-                    attention_mask.append([1] * len(example["input_ids"]))
+                current_prompt_ids = tokenized_prompt["input_ids"]
 
-            tokenized_prompt = self.tokenizer(
-                formatted_prompt,
-                truncation=True,
-                max_length=len(input_ids[-1]),
-                padding=False,
-                return_tensors=None,
-                add_special_tokens=False,
-            )
+            prompts_input_ids.append(current_prompt_ids)
+            prompt_attention_mask.append([1] * len(current_prompt_ids))
 
-            prompts_input_ids.append(tokenized_prompt["input_ids"])
-            prompt_attention_mask.append(tokenized_prompt["attention_mask"])
-
-            # Create the labels that will have all but the completion tokens of the example["input_ids"] set to ignore_index
             label = [self.ignore_index] * len(input_ids[-1])
-            completion_start_idx = len(tokenized_prompt["input_ids"])
+            completion_start_idx = len(current_prompt_ids)
             label[completion_start_idx:] = input_ids[-1][completion_start_idx:]
             labels.append(label)
 
@@ -168,15 +210,61 @@ class DataCollatorForChatML:
         }
 
 
+def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def _find_free_port() -> int:
+    candidates = (29500, 23456, 12355, 12345)
+    for p in candidates:
+        if _is_port_free(p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def ensure_master_addr_port(addr: str | None = None, port: int | None = None) -> None:
+    """
+    Ensure `MASTER_ADDR`/`MASTER_PORT` are set safely.
+
+    - Respects existing environment variables.
+    - Defaults `MASTER_ADDR` to localhost if unset.
+    - Chooses a free TCP port if `MASTER_PORT` is unset to avoid collisions.
+    - If `MASTER_PORT` is set to `"0"` or `"auto"`, it is resolved to a free port.
+    """
+    os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR") or addr or "localhost"
+
+    env_port = os.environ.get("MASTER_PORT", "").strip().lower()
+    if port is None and env_port not in {"", "0", "auto"}:
+        try:
+            port = int(env_port)
+        except ValueError:
+            pass
+
+    os.environ["MASTER_PORT"] = str(_find_free_port() if port in (None, 0) else port)
+
+
 @dataclass
 class RewardDataCollatorWithPadding:
+    # docstyle-ignore
     r"""
     Reward DataCollator class that pads the inputs to the maximum length of the batch.
 
+    > [!WARNING]
+    > This class is deprecated and will be removed in version 0.27.0. Please use
+    `trl.trainer.reward_trainer.DataCollatorForPreference` instead.
+
     Args:
-        tokenizer (`PreTrainedTokenizerBase`):
+        tokenizer ([`~transformers.PreTrainedTokenizerBase`]):
             The tokenizer used for encoding the data.
-        padding (`Union[bool, str, `PaddingStrategy`]`, `optional`, defaults to `True`):
+        padding (`bool | str | PaddingStrategy`, `optional`, defaults to `True`):
             padding_strategy to pass to the tokenizer.
         pad_to_multiple_of (`int` or `None`, `optional`, defaults to `None`):
             If set will pad the sequence to a multiple of the provided value.
@@ -185,9 +273,17 @@ class RewardDataCollatorWithPadding:
     """
 
     tokenizer: PreTrainedTokenizerBase
-    padding: Union[bool, str] = True
-    pad_to_multiple_of: Optional[int] = None
+    padding: bool | str = True
+    pad_to_multiple_of: int | None = None
     return_tensors: str = "pt"
+
+    def __init__(self, *args, **kwargs) -> None:
+        warnings.warn(
+            "The `RewardDataCollatorWithPadding` is deprecated and will be removed in version 0.27.0. Please use "
+            "`trl.trainer.reward_trainer.DataCollatorForPreference` instead.",
+            FutureWarning,
+        )
+        super().__init__(*args, **kwargs)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         features_chosen = []
@@ -250,7 +346,7 @@ def pad(
     tensors: list[torch.Tensor],
     padding_value: int = 0,
     padding_side: str = "right",
-    pad_to_multiple_of: Optional[int] = None,
+    pad_to_multiple_of: int | None = None,
 ) -> torch.Tensor:
     """
     Pads a list of tensors to the same shape along the first dimension.
@@ -262,7 +358,7 @@ def pad(
             Value to use for padding. Default is 0.
         padding_side (`str`):
             Side on which to add padding. Must be 'left' or 'right'. Default is 'right'.
-        pad_to_multiple_of (`int`, *optional*, defaults to `None`):
+        pad_to_multiple_of (`int`, *optional*):
             If set will pad the sequence to a multiple of the provided value.
 
     Returns:
@@ -328,7 +424,7 @@ class DPODataCollatorWithPadding:
 
     pad_token_id: int = 0
     label_pad_token_id: int = -100
-    is_encoder_decoder: Optional[bool] = False
+    is_encoder_decoder: bool | None = False
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         # first, pad everything to the same length
@@ -485,7 +581,12 @@ def compute_accuracy(eval_pred: EvalPrediction) -> dict[str, float]:
 
         # Flatten the predictions and labels to remove the ignored tokens.
         predictions = np.array(
-            [p for prediction, label in zip(predictions, labels) for (p, lbl) in zip(prediction, label) if lbl != -100]
+            [
+                p
+                for prediction, label in zip(predictions, labels, strict=True)
+                for (p, lbl) in zip(prediction, label, strict=True)
+                if lbl != -100
+            ]
         )
         labels = np.array([lbl for label in labels for lbl in label if lbl != -100])
 
@@ -516,7 +617,7 @@ def compute_accuracy(eval_pred: EvalPrediction) -> dict[str, float]:
     return {"accuracy": accuracy}
 
 
-def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float], dim: int = -1) -> torch.Tensor:
+def pad_to_length(tensor: torch.Tensor, length: int, pad_value: int | float, dim: int = -1) -> torch.Tensor:
     if tensor.size(dim) >= length:
         return tensor
     else:
@@ -544,48 +645,6 @@ def exact_div(a, b, custom_error_message=""):
     return q
 
 
-# copied from https://github.com/kvablack/ddpo-pytorch/blob/main/ddpo_pytorch/stat_tracking.py#L5
-class PerPromptStatTracker:
-    r"""
-    Class for tracking statistics per prompt. Mainly used to calculate advantage for the DPPO algorithm
-
-    Args:
-        buffer_size (`int`):
-            Size of the buffer to keep for each prompt.
-        min_count (`int`):
-            Minimum number of samples to keep in the buffer before calculating the mean and std.
-    """
-
-    def __init__(self, buffer_size, min_count):
-        self.buffer_size = buffer_size
-        self.min_count = min_count
-        self.stats = {}
-
-    def update(self, prompts, rewards):
-        prompts = np.array(prompts)
-        rewards = np.array(rewards)
-        unique = np.unique(prompts)
-        advantages = np.empty_like(rewards)
-        for prompt in unique:
-            prompt_rewards = rewards[prompts == prompt]
-            if prompt not in self.stats:
-                self.stats[prompt] = deque(maxlen=self.buffer_size)
-            self.stats[prompt].extend(prompt_rewards)
-
-            if len(self.stats[prompt]) < self.min_count:
-                mean = np.mean(rewards)
-                std = np.std(rewards) + 1e-6
-            else:
-                mean = np.mean(self.stats[prompt])
-                std = np.std(self.stats[prompt]) + 1e-6
-            advantages[prompts == prompt] = (prompt_rewards - mean) / std
-
-        return advantages
-
-    def get_stats(self):
-        return {k: {"mean": np.mean(v), "std": np.std(v), "count": len(v)} for k, v in self.stats.items()}
-
-
 def peft_module_casting_to_bf16(model):
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.LayerNorm) or "norm" in name:
@@ -596,14 +655,14 @@ def peft_module_casting_to_bf16(model):
                     module = module.to(torch.bfloat16)
 
 
-def get_quantization_config(model_args: ModelConfig) -> Optional[BitsAndBytesConfig]:
+def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | None:
     if model_args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=model_args.dtype,  # For consistency with model weights, we use the same value as `dtype`
             bnb_4bit_quant_type=model_args.bnb_4bit_quant_type,
             bnb_4bit_use_double_quant=model_args.use_bnb_nested_quant,
-            bnb_4bit_quant_storage=model_args.dtype,
+            bnb_4bit_quant_storage=model_args.bnb_4bit_quant_storage,
         )
     elif model_args.load_in_8bit:
         quantization_config = BitsAndBytesConfig(
@@ -615,14 +674,14 @@ def get_quantization_config(model_args: ModelConfig) -> Optional[BitsAndBytesCon
     return quantization_config
 
 
-def get_kbit_device_map() -> Optional[dict[str, int]]:
+def get_kbit_device_map() -> dict[str, int] | None:
     if torch.cuda.is_available() or is_torch_xpu_available():
         return {"": PartialState().local_process_index}
     else:
         return None
 
 
-def get_peft_config(model_args: ModelConfig) -> "Optional[PeftConfig]":
+def get_peft_config(model_args: ModelConfig) -> "PeftConfig | None":
     if model_args.use_peft is False:
         return None
 
@@ -684,14 +743,20 @@ def print_rich_table(df: pd.DataFrame) -> None:
     console.print(table)
 
 
-SIMPLE_SFT_CHAT_TEMPLATE = "{% for message in messages %}{{' ' + message['content']}}{% endfor %}{{ eos_token }}"
-# SIMPLE_SFT_CHAT_TEMPLATE simply ends things with an EOS token, this helps the SFT model learn to end the completions with EOS tokens
-
 SIMPLE_CHAT_TEMPLATE = "{% for message in messages %}{{message['role'].capitalize() + ': ' + message['content'] + '\n\n'}}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
 
 
 @dataclass
 class OnlineTrainerState(TrainerState):
+    """
+    Training state for online/on-policy trainers.
+
+    Extends [`~transformers.TrainerState`] with an `episode` counter to track the current rollout/episode.
+
+    Args:
+        episode (`int`, defaults to 0): Zero-based episode index.
+    """
+
     episode: int = 0
 
 
@@ -709,13 +774,13 @@ class OnPolicyConfig(TrainingArguments):
     command line.
 
     Parameters:
-        run_name (`str` or `None`, *optional*, defaults to `None`):
+        run_name (`str`, *optional*):
             Name of the run.
-        dataset_num_proc (`int` or `None`, *optional*, defaults to `None`):
+        dataset_num_proc (`int`, *optional*):
             Number of processes to use for processing the dataset.
         num_mini_batches (`int`, *optional*, defaults to `1`):
             Number of minibatches to split a batch into.
-        total_episodes (`int` or `None`, *optional*, defaults to `None`):
+        total_episodes (`int`, *optional*):
             Total number of episodes in the dataset.
         local_rollout_forward_batch_size (`int`, *optional*, defaults to `64`):
             Per rank no grad forward pass in the rollout phase.
@@ -723,38 +788,38 @@ class OnPolicyConfig(TrainingArguments):
             Number of debugging samples generations (i.e., `generate_completions` calls) throughout training.
         response_length (`int`, *optional*, defaults to `53`):
             Length of the response.
-        stop_token (`str` or `None`, *optional*, defaults to `None`):
+        stop_token (`str`, *optional*):
             Specifies the stop token to use for text generation. This parameter is mutually exclusive with
             `stop_token_id`.
 
             - `None`: No stop token is applied, unless `stop_token_id` is specified.
             - `'eos'`: Uses the tokenizer's `eos_token`.
 
-        stop_token_id (`int` or `None`, *optional*, defaults to `None`):
+        stop_token_id (`int`, *optional*):
             Specifies the ID of the stop token to use for text generation. If `None`, no stop token ID is applied,
             unless `stop_token` is specified. This parameter is mutually exclusive with `stop_token`.
         temperature (`float`, *optional*, defaults to `0.7`):
             Sampling temperature.
-        missing_eos_penalty (`float` or `None`, *optional*, defaults to `None`):
+        missing_eos_penalty (`float`, *optional*):
             Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage to
             generate completions shorter than the maximum length (`max_new_tokens`). The penalty must be a positive
             value.
         sft_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
             Path to the SFT model.
-        world_size (`int` or `None`, *optional*, defaults to `None`):
+        world_size (`int`, *optional*):
             Number of processes (GPUs) to use for the training.
-        num_total_batches (`int` or `None`, *optional*, defaults to `None`):
+        num_total_batches (`int`, *optional*):
             Number of total batches to train.
-        micro_batch_size (`int` or `None`, *optional*, defaults to `None`):
+        micro_batch_size (`int`, *optional*):
             Micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`).
-        local_batch_size (`int` or `None`, *optional*, defaults to `None`):
+        local_batch_size (`int`, *optional*):
             Batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`).
-        batch_size (`int` or `None`, *optional*, defaults to `None`):
+        batch_size (`int`, *optional*):
             Batch size across devices (HF's `per_device_train_batch_size` * `world_size` *
             `gradient_accumulation_steps`).
-        local_mini_batch_size (`int` or `None`, *optional*, defaults to `None`):
+        local_mini_batch_size (`int`, *optional*):
             Mini batch size per GPU.
-        mini_batch_size (`int` or `None`, *optional*, defaults to `None`):
+        mini_batch_size (`int`, *optional*):
             Mini batch size across GPUs.
         push_to_hub (`bool`, *optional*, defaults to `False`):
             Whether to push the model to the Hub after training.
@@ -774,7 +839,7 @@ class OnPolicyConfig(TrainingArguments):
             "help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."
         },
     )
-    bf16: Optional[bool] = field(
+    bf16: bool | None = field(
         default=None,
         metadata={
             "help": "Whether to use bf16 (mixed) precision instead of 32-bit. Requires Ampere or higher NVIDIA "
@@ -782,12 +847,22 @@ class OnPolicyConfig(TrainingArguments):
             "`fp16` is not set."
         },
     )
+    # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
+    # was fixed in https://github.com/huggingface/transformers/pull/41322, but the fix has not yet been released. We
+    # add a temporary workaround here, which can be removed once the fix is available—likely in Transformers 4.57.2.
+    lr_scheduler_kwargs: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": "Additional parameters for the lr_scheduler, such as {'num_cycles': 1} for cosine with hard "
+            "restarts."
+        },
+    )
 
-    run_name: Optional[str] = field(
+    run_name: str | None = field(
         default=None,
         metadata={"help": "Name of the run."},
     )
-    dataset_num_proc: Optional[int] = field(
+    dataset_num_proc: int | None = field(
         default=None,
         metadata={"help": "Number of processes to use for processing the dataset."},
     )
@@ -795,7 +870,7 @@ class OnPolicyConfig(TrainingArguments):
         default=1,
         metadata={"help": "Number of minibatches to split a batch into."},
     )
-    total_episodes: Optional[int] = field(
+    total_episodes: int | None = field(
         default=None,
         metadata={"help": "Total number of episodes in the dataset."},
     )
@@ -813,14 +888,14 @@ class OnPolicyConfig(TrainingArguments):
         default=53,
         metadata={"help": "Length of the response."},
     )
-    stop_token: Optional[Literal["eos"]] = field(
+    stop_token: Literal["eos"] | None = field(
         default=None,
         metadata={
             "help": "Specifies the stop token to use for text generation. This parameter is mutually exclusive with "
             "`stop_token_id`."
         },
     )
-    stop_token_id: Optional[int] = field(
+    stop_token_id: int | None = field(
         default=None,
         metadata={
             "help": "Specifies the ID of the stop token to use for text generation. If `None`, no stop token ID is "
@@ -831,7 +906,7 @@ class OnPolicyConfig(TrainingArguments):
         default=0.7,
         metadata={"help": "Sampling temperature."},
     )
-    missing_eos_penalty: Optional[float] = field(
+    missing_eos_penalty: float | None = field(
         default=None,
         metadata={
             "help": "Penalty applied to the score when the model fails to generate an EOS token. This is useful to "
@@ -843,34 +918,34 @@ class OnPolicyConfig(TrainingArguments):
         default="EleutherAI/pythia-160m",
         metadata={"help": "Path to the SFT model."},
     )
-    world_size: Optional[int] = field(
+    world_size: int | None = field(
         default=None,
         metadata={"help": "Number of processes (GPUs) to use for the training."},
     )
-    num_total_batches: Optional[int] = field(
+    num_total_batches: int | None = field(
         default=None,
         metadata={"help": "Number of total batches to train."},
     )
-    micro_batch_size: Optional[int] = field(
+    micro_batch_size: int | None = field(
         default=None,
         metadata={"help": "Micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`)."},
     )
-    local_batch_size: Optional[int] = field(
+    local_batch_size: int | None = field(
         default=None,
         metadata={"help": "Batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)."},
     )
-    batch_size: Optional[int] = field(
+    batch_size: int | None = field(
         default=None,
         metadata={
             "help": "Batch size across devices (HF's `per_device_train_batch_size` * `world_size` * "
             "`gradient_accumulation_steps`)."
         },
     )
-    local_mini_batch_size: Optional[int] = field(
+    local_mini_batch_size: int | None = field(
         default=None,
         metadata={"help": "Mini batch size per GPU."},
     )
-    mini_batch_size: Optional[int] = field(
+    mini_batch_size: int | None = field(
         default=None,
         metadata={"help": "Mini batch size across GPUs."},
     )
@@ -1002,6 +1077,10 @@ def prepare_deepspeed(
             The model to be prepared for DeepSpeed training.
         per_device_train_batch_size (`int`):
             The training batch size per device.
+        fp16 (`bool`, defaults to `False`):
+            Whether to use FP16 precision.
+        bf16 (`bool`, defaults to `False`):
+            Whether to use BF16 precision.
 
     Returns:
         `torch.nn.Module`:
@@ -1080,7 +1159,7 @@ def generate(
             The tensor containing the input queries.
         pad_token_id (`int`):
             The token ID representing the pad token.
-        generation_config (`GenerationConfig`):
+        generation_config ([`~transformers.GenerationConfig`]):
             The configuration for the generation process.
 
     Returns:
@@ -1140,7 +1219,7 @@ def batch_generation(
 
 
 def add_bos_token_if_needed(
-    bos_token_id: Optional[int],
+    bos_token_id: int | None,
     prompt_len_input_ids: int,
     prompt_tokens: dict[str, list[int]],
     chosen_prompt_len_input_ids: int,
@@ -1220,39 +1299,22 @@ def empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def decode_and_strip_padding(inputs: torch.Tensor, tokenizer: PreTrainedTokenizerBase) -> list[str]:
-    """
-    Decodes the input tensor and strips the padding tokens.
-
-    Args:
-        inputs (`torch.Tensor`):
-            The input tensor to be decoded.
-        tokenizer (`transformers.PreTrainedTokenizerBase`):
-            The tokenizer used to decode the input tensor.
-
-    Returns:
-        `list[str]`:
-            The list of decoded strings with padding tokens stripped.
-    """
-    decoded = tokenizer.batch_decode(inputs, skip_special_tokens=False)
-    return [d.replace(tokenizer.pad_token, "") for d in decoded]
-
-
 def generate_model_card(
-    base_model: Optional[str],
+    base_model: str | None,
     model_name: str,
     hub_model_id: str,
-    dataset_name: Optional[str],
+    dataset_name: str | None,
     tags: list[str],
-    wandb_url: Optional[str],
+    wandb_url: str | None,
     trainer_name: str,
-    trainer_citation: Optional[str] = None,
-    paper_title: Optional[str] = None,
-    paper_id: Optional[str] = None,
-    comet_url: Optional[str] = None,
+    trainer_citation: str | None = None,
+    template_file: str | None = None,
+    paper_title: str | None = None,
+    paper_id: str | None = None,
+    comet_url: str | None = None,
 ) -> ModelCard:
     """
-    Generate a `ModelCard` from a template.
+    Generate a [`~huggingface_hub.ModelCard`] from a template.
 
     Args:
         base_model (`str` or `None`):
@@ -1273,13 +1335,15 @@ def generate_model_card(
             Trainer name.
         trainer_citation (`str` or `None`, defaults to `None`):
             Trainer citation as a BibTeX entry.
+        template_file (`str` *optional*):
+            Template file name located in the `trl/templates` directory. Defaults to `lm_model_card.md`.
         paper_title (`str` or `None`, defaults to `None`):
             Paper title.
         paper_id (`str` or `None`, defaults to `None`):
             ArXiv paper ID as `YYMM.NNNNN`.
 
     Returns:
-        `ModelCard`:
+        [`~huggingface_hub.ModelCard`]:
             A ModelCard object.
     """
     card_data = ModelCardData(
@@ -1290,9 +1354,10 @@ def generate_model_card(
         model_name=model_name,
         tags=["generated_from_trainer", *tags],
     )
+    template_file = template_file or "lm_model_card.md"
     card = ModelCard.from_template(
         card_data,
-        template_path=str(pkg_resources.files("trl").joinpath("templates/lm_model_card.md")),
+        template_path=str(pkg_resources.files("trl").joinpath(f"templates/{template_file}")),
         base_model=base_model,
         model_name=model_name,
         hub_model_id=hub_model_id,
@@ -1312,7 +1377,7 @@ def generate_model_card(
     return card
 
 
-def get_comet_experiment_url() -> Optional[str]:
+def get_comet_experiment_url() -> str | None:
     """
     If Comet integration is enabled, return the URL of the current Comet experiment; otherwise, return `None`.
     """
@@ -1332,7 +1397,7 @@ def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
     Args:
         name (`str`):
             Table name.
-        table (`pd.DataFrame`):
+        table (`pandas.DataFrame`):
             The Pandas DataFrame containing the table to log.
     """
     if not is_comet_available():
@@ -1343,7 +1408,7 @@ def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
         experiment.log_table(tabular_data=table, filename=name)
 
 
-def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
+def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """
     Shift non-zero elements in the mask and corresponding tensors to the left.
 
@@ -1359,7 +1424,7 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> Union[torch.Tensor
     Args:
         mask (`torch.Tensor`):
             2D tensor (binary mask) with shape `(N, M)`.
-        *tensors (`torch.Tensor`)
+        *tensors (`torch.Tensor`):
             One or more 2D tensors with the same shape as `mask`. These tensors will be processed alongside `mask`,
             with non-zero values shifted and excess zero columns truncated in the same manner.
 
@@ -1408,7 +1473,7 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> Union[torch.Tensor
     return flushed_mask, *flushed_tensors
 
 
-def flush_right(mask: torch.Tensor, *tensors: torch.Tensor) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
+def flush_right(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """
     Shift non-zero elements in the mask and corresponding tensors to the right. See `flush_left` for details.
     """
@@ -1465,7 +1530,7 @@ def selective_log_softmax(logits, index) -> torch.Tensor:
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
         per_token_logps = []
-        for row_logits, row_labels in zip(logits, index):  # loop to reduce peak mem consumption
+        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
             row_logps = F.log_softmax(row_logits, dim=-1)
             row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
             per_token_logps.append(row_per_token_logps)
@@ -1511,8 +1576,8 @@ def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Te
 
 
 def print_prompt_completions_sample(
-    prompts: list[str],
-    completions: list[str],
+    prompts: list,
+    completions: list,
     rewards: dict[str, list[float]],
     advantages: list[float],
     step: int,
@@ -1525,17 +1590,17 @@ def print_prompt_completions_sample(
     during training. It requires the `rich` library to be installed.
 
     Args:
-        prompts (`list[str]`):
-            List of prompts.
-        completions (`list[str]`):
-            List of completions corresponding to the prompts.
+        prompts (`list`):
+            List of prompts. Can be either strings or lists of messages.
+        completions (`list`):
+            List of completions corresponding to the prompts. Can be either strings or lists of messages.
         rewards (`dict[str, list[float]]`):
             Dictionary where keys are reward names and values are lists of rewards.
         advantages (`list[float]`):
             List of advantages corresponding to the prompts and completions.
         step (`int`):
             Current training step number, used in the output title.
-        num_samples (`int` or `None`, *optional*, defaults to `None`):
+        num_samples (`int`, *optional*):
             Number of random samples to display. If `None` (default), all items will be displayed.
 
     Example:
@@ -1573,6 +1638,28 @@ def print_prompt_completions_sample(
         table.add_column(reward_name, style="bold cyan", justify="right")
     table.add_column("Advantage", style="bold magenta", justify="right")
 
+    def format_entry(entry) -> Text:
+        t = Text()
+        if isinstance(entry, list) and all(isinstance(m, dict) for m in entry):
+            for j, msg in enumerate(entry):
+                role = msg.get("role", "")
+                if "content" in msg:
+                    # Chat message
+                    t.append(f"{role.upper()}\n", style="bold red")
+                    t.append(msg["content"])
+                elif "name" in msg and "args" in msg:
+                    # Tool call
+                    t.append(f"{role.upper()}\n", style="bold red")
+                    t.append(f"{msg['name']}({msg['args']})")
+                else:
+                    # Fallback
+                    t.append(str(msg))
+                if j < len(entry) - 1:
+                    t.append("\n\n")
+        else:
+            t.append(str(entry))
+        return t
+
     # Some basic input validation
     if num_samples is not None:
         if num_samples >= len(prompts):
@@ -1590,7 +1677,12 @@ def print_prompt_completions_sample(
 
     for i in range(len(prompts)):
         reward_values = [f"{rewards[key][i]:.2f}" for key in rewards.keys()]  # 2 decimals
-        table.add_row(Text(prompts[i]), Text(completions[i]), *reward_values, f"{advantages[i]:.2f}")
+        table.add_row(
+            format_entry(prompts[i]),
+            format_entry(completions[i]),
+            *reward_values,
+            f"{advantages[i]:.2f}",
+        )
         table.add_section()  # Adds a separator between rows
 
     panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
@@ -1612,7 +1704,7 @@ class RepeatSampler(Sampler):
             Number of times to repeat the full sampling process.
         shuffle (`bool`, *optional*, defaults to `True`):
             Whether to shuffle the dataset.
-        seed (`int` or `None`, *optional*, defaults to `None`):
+        seed (`int`, *optional*):
             Random seed for reproducibility (only affects this sampler).
 
     Example:
@@ -1653,7 +1745,7 @@ class RepeatSampler(Sampler):
         batch_size: int = 1,
         repeat_count: int = 1,
         shuffle: bool = True,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ):
         self.data_source = data_source
         self.mini_repeat_count = mini_repeat_count
@@ -1713,8 +1805,8 @@ def nanstd(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def split_tensor_dict(
-    tensor_dict: dict[str, Optional[torch.Tensor]], num_chunks: int
-) -> list[dict[str, Optional[torch.Tensor]]]:
+    tensor_dict: dict[str, torch.Tensor | None], num_chunks: int
+) -> list[dict[str, torch.Tensor | None]]:
     """
     Splits a dictionary of tensors along the first dimension into `num_chunks` equal parts.
 
@@ -1747,7 +1839,7 @@ def split_tensor_dict(
     return chunks
 
 
-def shuffle_sequence_dict(seq_dict: dict[str, Optional[Sequence]]) -> dict[str, Optional[Sequence]]:
+def shuffle_sequence_dict(seq_dict: dict[str, Sequence | None]) -> dict[str, Sequence | None]:
     """
     Shuffles all sequence-like values in a dictionary along the first dimension in unison.
 
@@ -1767,7 +1859,7 @@ def shuffle_sequence_dict(seq_dict: dict[str, Optional[Sequence]]) -> dict[str, 
     batch_size = len(next(v for v in seq_dict.values() if v is not None))
     permutation = torch.randperm(batch_size)
 
-    def permute(v: Optional[Sequence]) -> Optional[Sequence]:
+    def permute(v: Sequence | None) -> Sequence | None:
         if v is None:
             return None
         if isinstance(v, torch.Tensor) and v.ndim == 0:
@@ -1814,92 +1906,124 @@ def identity(x):
     return x
 
 
-def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, Union[torch.Tensor, list[torch.Tensor]]]:
+def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """
-    Splits `batch["pixel_values"]` into a list of tensors based on the product of each row in
-    `batch["image_grid_thw"]`, while keeping other entries unchanged.
+    Splits `batch["pixel_values"]` into a list of tensors based on the product of each row in `batch["image_grid_thw"]`
+    and batch["num_images"] while keeping other entries unchanged.
     """
-    if "image_grid_thw" not in batch or "pixel_values" not in batch:
+    if "image_grid_thw" not in batch or "pixel_values" not in batch or "num_images" not in batch:
         return batch
 
-    lengths = batch["image_grid_thw"].prod(dim=1).tolist()  # [batch_size]
+    lengths = batch["image_grid_thw"].prod(-1).tolist()  # [num_images]
     pixel_values = batch["pixel_values"]  # [total, feature_dim]
 
     if sum(lengths) != pixel_values.size(0):
         raise ValueError(f"Mismatch: sum(lengths) = {sum(lengths)} != pixel_values.size(0) = {pixel_values.size(0)}")
 
-    split_values = list(torch.split(batch["pixel_values"], lengths, dim=0))
-    return {**batch, "pixel_values": split_values}
+    boundaries = [0, *accumulate(batch["num_images"])]  # [3, 4, 5] -> [0, 3, 7, 12]
+    sections = [sum(lengths[boundaries[i] : boundaries[i + 1]]) for i in range(len(batch["num_images"]))]
+    split_values = list(torch.split(batch["pixel_values"], sections, dim=0))
+    image_grid_thw = list(torch.split(batch["image_grid_thw"], batch["num_images"], dim=0))
+    return {**batch, "pixel_values": split_values, "image_grid_thw": image_grid_thw}
 
 
-def unsplit_pixel_values_by_grid(batch: dict[str, Union[torch.Tensor, list[torch.Tensor]]]) -> dict[str, torch.Tensor]:
+def unsplit_pixel_values_by_grid(batch: dict[str, torch.Tensor | list[torch.Tensor]]) -> dict[str, torch.Tensor]:
     """
     Opposite of `split_pixel_values_by_grid`. Merges a list of tensors in `batch["pixel_values"]` back into a single
     tensor along the first dimension.
     """
     pixel_values = batch.get("pixel_values")
-
     if isinstance(pixel_values, list):
         merged = torch.cat(pixel_values, dim=0)
-        return {**batch, "pixel_values": merged}
-    else:
-        return batch
+        batch = {**batch, "pixel_values": merged}
+
+    image_grid_thw = batch.get("image_grid_thw")
+    if isinstance(image_grid_thw, list):
+        merged = torch.cat(image_grid_thw, dim=0)
+        batch = {**batch, "image_grid_thw": merged}
+
+    return batch
 
 
-def truncate_with_protected_tokens(
-    ids: torch.Tensor, mask: torch.Tensor, target_length: int, protected_tokens: list[int]
-) -> tuple[torch.Tensor, torch.Tensor]:
+TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
+
+
+def remove_none_values(example: TListOrMapping) -> TListOrMapping:
     """
-    Truncate tensors to target length while preserving protected tokens.
+    Recursively removes entries with `None` values from a nested structure (list or dictionary).
 
     Args:
-        ids (`torch.Tensor`):
-            Input tensor of token IDs, shape (batch_size, sequence_length).
-        mask (`torch.Tensor`):
-            Input tensor of attention masks, shape (batch_size, sequence_length).
-        target_length (`int`):
-            Desired length of the output sequences.
-        protected_tokens (`list[int]`):
-            List of token IDs that should be preserved in the output.
+        example (`list` or `Mapping`):
+            Input nested structure (list or dictionary) from which to remove `None`.
+
+    Example:
+    ```python
+    >>> [
+    ...     {
+    ...         "a": {"aa": None, "ab": 1},
+    ...         "b": "my_string",
+    ...     }
+    ... ]
+    >>> remove_none_values(example)
+    [{'a': {'ab': 1}, 'b': 'my_string'}]
+    ```
     """
-    protected_set = set(protected_tokens)
-    # Create protected_tokens tensor once to avoid recreating it on every call
-    protected_tokens_tensor = torch.tensor(list(protected_set), device=ids.device)
+    if isinstance(example, list):
+        return [remove_none_values(value) if isinstance(value, (dict, list)) else value for value in example]
+    elif isinstance(example, Mapping):
+        return {
+            key: remove_none_values(value) if isinstance(value, (dict, list)) else value
+            for key, value in example.items()
+            if value is not None
+        }
+    else:
+        raise TypeError("Input must be a list or a dictionary.")
 
-    def process_sequence(ids, mask):
-        # Create boolean masks
-        is_protected = torch.isin(ids, protected_tokens_tensor)
-        is_non_protected = ~is_protected
 
-        # Count tokens
-        num_protected = is_protected.sum().item()
-        num_non_protected_needed = target_length - num_protected
+def create_model_from_path(model_id: str, **kwargs) -> PreTrainedModel:
+    """
+    Create a model from a given path using the specified initialization arguments.
 
-        if num_non_protected_needed < 0:
-            raise ValueError(
-                f"target_length ({target_length}) is too small for the protected tokens ({num_protected} tokens). "
-                f"Please increase target length to at least {num_protected} or disable truncation."
-            )
+    Args:
+        model_id (`str`):
+            Path to the model. Can be either a local directory or a model identifier from the Hugging Face Hub.
+        kwargs (`dict`):
+            Initialization keyword arguments to pass to the model's `from_pretrained` method. When `'dtype'` is
+            specified, it can be either a `torch.dtype` or one of the strings: `'bfloat16'`, `'float16'`, `'float32'`,
+            or `'auto'`.
 
-        # Select which non-protected tokens to keep (rightmost ones)
-        non_protected_indices = torch.where(is_non_protected)[0]
-        keep_non_protected = torch.zeros_like(is_non_protected)
-        if num_non_protected_needed > 0:
-            keep_indices = non_protected_indices[-num_non_protected_needed:]
-            keep_non_protected[keep_indices] = True
+    Returns:
+        [`~transformers.PreTrainedModel`]:
+            The instantiated model.
+    """
+    dtype = kwargs.get("dtype", "auto")
+    if isinstance(dtype, torch.dtype) or dtype == "auto" or dtype is None:
+        pass  # dtype is already a torch.dtype or "auto" or None
+    elif isinstance(dtype, str) and dtype in ["bfloat16", "float16", "float32"]:
+        kwargs["dtype"] = getattr(torch, dtype)
+    else:
+        raise ValueError(
+            "Invalid `dtype` passed to the config. Expected either 'auto' or a string representing "
+            f"a valid `torch.dtype` (e.g., 'float32'), but got {dtype}."
+        )
+    kwargs["device_map"] = kwargs.get("device_map", "auto")
+    config = AutoConfig.from_pretrained(model_id)
+    architecture = getattr(transformers, config.architectures[0])
+    model = architecture.from_pretrained(model_id, **kwargs)
+    return model
 
-        # Final mask: protected OR selected non-protected
-        keep_mask = is_protected | keep_non_protected
 
-        return ids[keep_mask], mask[keep_mask]
+def get_config_model_id(config: PretrainedConfig) -> str:
+    """
+    Retrieve the model identifier from a given model configuration.
 
-    # Process each sequence in the batch
-    truncated_seq = []
-    truncated_mask = []
+    Args:
+        config ([`~transformers.PreTrainedConfig`]):
+            Configuration from which to extract the model identifier.
 
-    for i in range(ids.shape[0]):
-        new_ids, new_mask = process_sequence(ids[i], mask[i])
-        truncated_seq.append(new_ids)
-        truncated_mask.append(new_mask)
-
-    return torch.stack(truncated_seq), torch.stack(truncated_mask)
+    Returns:
+        `str`:
+            The model identifier associated with the model configuration.
+    """
+    # Fall back to `config.text_config._name_or_path` if `config._name_or_path` is missing: Qwen2-VL and Qwen2.5-VL. See GH-4323
+    return getattr(config, "_name_or_path", "") or getattr(getattr(config, "text_config", None), "_name_or_path", "")

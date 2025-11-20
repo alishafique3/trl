@@ -14,7 +14,6 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional, Union
 
 from transformers import TrainingArguments
 
@@ -35,9 +34,9 @@ class RLOOConfig(TrainingArguments):
     Parameters:
         > Parameters that control the model and reference model
 
-        model_init_kwargs (`str`, `dict[str, Any]` or `None`, *optional*, defaults to `None`):
+        model_init_kwargs (`str`, `dict[str, Any]`, *optional*):
             Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
-            argument of the [`GRPOTrainer`] is provided as a string.
+            argument of the [`RLOOTrainer`] is provided as a string.
         disable_dropout (`bool`, *optional*, defaults to `False`):
             Whether to disable dropout in the model. This is useful for training with a reference model, as it prevents
             the model from generating different logprobs for the same input.
@@ -64,11 +63,11 @@ class RLOOConfig(TrainingArguments):
 
         > Parameters that control generation
 
-        generation_batch_size: (`int` or `None`, *optional*, defaults to `None`):
+        generation_batch_size: (`int`, *optional*):
             Batch size to use for generation. If `None`, it defaults to the effective training batch size:
             `per_device_train_batch_size * num_processes * steps_per_generation`. In other words, there is one
             generation batch processed per optimization step. Mutually exclusive with `steps_per_generation`.
-        steps_per_generation: (`int` or `None`, *optional*, defaults to `None`):
+        steps_per_generation: (`int`, *optional*):
             Number of steps per generation. If `None`, it defaults to `gradient_accumulation_steps`. Mutually exclusive
             with `generation_batch_size`.
         temperature (`float`, defaults to `1.0`):
@@ -76,12 +75,19 @@ class RLOOConfig(TrainingArguments):
         top_p (`float`, *optional*, defaults to `1.0`):
             Float that controls the cumulative probability of the top tokens to consider. Must be in (0, 1]. Set to
             `1.0` to consider all tokens.
-        top_k (`int` or `None`, *optional*, defaults to `None`):
+        top_k (`int`, *optional*):
             Number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, top-k-filtering is
             disabled and all tokens are considered.
-        min_p (`float` or `None`, *optional*, defaults to `None`):
+        min_p (`float`, *optional*):
             Minimum token probability, which will be scaled by the probability of the most likely token. It must be a
             value between `0.0` and `1.0`. Typical values are in the `0.01-0.2` range.
+        generation_kwargs (`dict[str, Any]`, *optional*):
+            Additional keyword arguments to pass to [`~transformers.GenerationConfig`] (if using transformers) or
+            `SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the
+            generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that conflict
+            with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them.
+        chat_template_kwargs (`dict[str, Any]`, *optional*):
+            Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         repetition_penalty (`float`, *optional*, defaults to `1.0`):
             Float that penalizes new tokens based on whether they appear in the prompt and the generated text so far.
             Values > `1.0` encourage the model to use new tokens, while values < `1.0` encourage the model to repeat
@@ -90,13 +96,8 @@ class RLOOConfig(TrainingArguments):
             Whether to use the `transformers` paged implementation for generation. If set to `True`, the `transformers`
             paged implementation will be used for generation instead of the default padded implementation. This
             parameter is only effective when `use_vllm` is set to `False`.
-        cache_implementation (`str` or `None`, *optional*, defaults to `None`):
+        cache_implementation (`str`, *optional*):
             Implementation of the cache method for faster generation when `use_vllm` is set to `False`.
-        generation_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
-            Additional keyword arguments to pass to `GenerationConfig` (if using transformers) or `SamplingParams` (if
-            using vLLM) when sampling completions. This can be used to further customize the generation behavior, such
-            as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that conflict with the other generation
-            parameters (like `min_p`, `top_p`, etc.), they will override them.
 
         > Parameters that control generation acceleration powered by vLLM
 
@@ -115,12 +116,12 @@ class RLOOConfig(TrainingArguments):
             Model implementation to use for vLLM. Must be one of `"transformers"` or `"vllm"`. `"transformers"`: Use
             the `transformers` backend for model implementation. `"vllm"`: Use the `vllm` library for model
             implementation.
-        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+        vllm_guided_decoding_regex (`str`, *optional*):
             Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
 
         > Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
 
-        vllm_server_base_url (`str` or `None`, *optional*, defaults to `None`):
+        vllm_server_base_url (`str`, *optional*):
             Base URL for the vLLM server (e.g., `"http://localhost:8000"`). If provided, `vllm_server_host` and
             `vllm_server_port` are ignored.
         vllm_server_host (`str`, *optional*, defaults to `"0.0.0.0"`):
@@ -141,6 +142,9 @@ class RLOOConfig(TrainingArguments):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
+        vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
+            Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory usage low, but
+            waking the engine adds host–device transfer latency.
 
         > Parameters that control the training
 
@@ -151,16 +155,16 @@ class RLOOConfig(TrainingArguments):
             Number of iterations per batch (denoted as μ in the algorithm).
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
-        epsilon_high (`float` or `None`, *optional*, defaults to `None`):
+        epsilon_high (`float`, *optional*):
             Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound
             specified in argument `epsilon`. Paper [DAPO](https://huggingface.co/papers/2503.14476) recommends `0.28`.
-        reward_weights (`list[float]` or `None`, *optional*, defaults to `None`):
+        reward_weights (`list[float]`, *optional*):
             Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are
             weighted equally with weight `1.0`.
         normalize_advantages (`bool`, *optional*, defaults to `False`):
             Whether to normalize advantages. Normalization is done per generation batch to have mean `0.0` and standard
             deviation of `1.0`.
-        reward_clip_range (`tuple[float, float]` or `None`, *optional*, defaults to `None`):
+        reward_clip_range (`tuple[float, float]`, *optional*):
             Clip range for rewards as (min, max). If `None`, no clipping is applied.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
@@ -184,12 +188,24 @@ class RLOOConfig(TrainingArguments):
 
         log_completions (`bool`, *optional*, defaults to `False`):
             Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is installed,
-            it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`.
-        num_completions_to_print (`int` or `None`, *optional*, defaults to `None`):
+            it prints the sample. If `wandb` and/or `trackio` logging is enabled, it logs it to `wandb` and/or
+            `trackio`.
+        num_completions_to_print (`int`, *optional*):
             Number of completions to print with `rich`. If `None`, all completions are logged.
-        wandb_log_unique_prompts (`bool`, *optional*, defaults to `False`):
-            Whether to log unique prompts in wandb. If `True`, only unique prompts are logged. If `False`, all prompts
-            are logged.
+        log_unique_prompts (`bool`, *optional*, defaults to `False`):
+            Whether to log unique prompts. If `True`, only unique prompts are logged. If `False`, all prompts are
+            logged.
+
+        > Deprecated arguments
+
+        wandb_log_unique_prompts (`bool`, *optional*):
+
+            <Deprecated version="0.26.0">
+
+            Parameter `wandb_log_unique_prompts` is deprecated and will be removed in version 0.27.0. Use
+            `log_unique_prompts` instead.
+
+            </Deprecated>
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
@@ -212,7 +228,7 @@ class RLOOConfig(TrainingArguments):
             "help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."
         },
     )
-    bf16: Optional[bool] = field(
+    bf16: bool | None = field(
         default=None,
         metadata={
             "help": "Whether to use bf16 (mixed) precision instead of 32-bit. Requires Ampere or higher NVIDIA "
@@ -220,13 +236,23 @@ class RLOOConfig(TrainingArguments):
             "`fp16` is not set."
         },
     )
+    # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
+    # was fixed in https://github.com/huggingface/transformers/pull/41322, but the fix has not yet been released. We
+    # add a temporary workaround here, which can be removed once the fix is available—likely in Transformers 4.57.2.
+    lr_scheduler_kwargs: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": "Additional parameters for the lr_scheduler, such as {'num_cycles': 1} for cosine with hard "
+            "restarts."
+        },
+    )
 
     # Parameters that control the model and reference model
-    model_init_kwargs: Optional[Union[dict, str]] = field(
+    model_init_kwargs: dict | str | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
-            "argument of the `GRPOTrainer` is provided as a string."
+            "argument of the `RLOOTrainer` is provided as a string."
         },
     )
     disable_dropout: bool = field(
@@ -238,29 +264,29 @@ class RLOOConfig(TrainingArguments):
     )
 
     # Parameters that control the data preprocessing
-    # The default value remove_unused_columns is overwritten from the parent class, because in GRPO we usually rely on
+    # The default value remove_unused_columns is overwritten from the parent class, because in RLOO we usually rely on
     # additional columns to compute the reward
-    remove_unused_columns: Optional[bool] = field(
+    remove_unused_columns: bool | None = field(
         default=False,
         metadata={
             "help": "Whether to only keep the column 'prompt' in the dataset. If you use a custom reward function "
             "that requires any column other than 'prompts' and 'completions', you should keep this to `False`."
         },
     )
-    max_prompt_length: Optional[int] = field(
+    max_prompt_length: int | None = field(
         default=512,
         metadata={
             "help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."
         },
     )
-    num_generations: Optional[int] = field(
+    num_generations: int | None = field(
         default=2,
         metadata={
             "help": "Number of generations to sample. The effective batch size (num_processes * per_device_batch_size "
             "* gradient_accumulation_steps) must be evenly divisible by this value."
         },
     )
-    max_completion_length: Optional[int] = field(
+    max_completion_length: int | None = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
     )
@@ -273,20 +299,20 @@ class RLOOConfig(TrainingArguments):
             "is not compatible with vLLM generation."
         },
     )
-    shuffle_dataset: Optional[bool] = field(
+    shuffle_dataset: bool | None = field(
         default=True,
         metadata={"help": "Whether to shuffle the training dataset."},
     )
 
     # Parameters that control generation
-    generation_batch_size: Optional[int] = field(
+    generation_batch_size: int | None = field(
         default=None,
         metadata={
             "help": "Batch size to use for generation. If `None`, it defaults to the effective training batch size: "
             "`per_device_train_batch_size * num_processes * steps_per_generation`."
         },
     )
-    steps_per_generation: Optional[int] = field(
+    steps_per_generation: int | None = field(
         default=None,
         metadata={"help": "Number of steps per generation. If `None`, it defaults to `gradient_accumulation_steps`."},
     )
@@ -301,27 +327,34 @@ class RLOOConfig(TrainingArguments):
             "Set to 1.0 to consider all tokens."
         },
     )
-    top_k: Optional[int] = field(
+    top_k: int | None = field(
         default=None,
         metadata={
             "help": "Number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, "
             "top-k-filtering is disabled and all tokens are considered."
         },
     )
-    min_p: Optional[float] = field(
+    min_p: float | None = field(
         default=None,
         metadata={
             "help": "Minimum token probability, which will be scaled by the probability of the most likely token. It "
             "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range."
         },
     )
-    generation_kwargs: Optional[dict] = field(
+    generation_kwargs: dict | None = field(
         default=None,
         metadata={
             "help": "Additional keyword arguments to pass to `GenerationConfig` (if using transformers) or "
             "`SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the "
             "generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that "
             "conflict with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them."
+        },
+    )
+    chat_template_kwargs: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Additional keyword arguments to pass to the `apply_chat_template` function when generating "
+            "completions."
         },
     )
     repetition_penalty: float = field(
@@ -340,7 +373,7 @@ class RLOOConfig(TrainingArguments):
             "implementation. This parameter is only effective when `use_vllm` is set to `False`."
         },
     )
-    cache_implementation: Optional[str] = field(
+    cache_implementation: str | None = field(
         default=None,
         metadata={"help": "Implementation of the cache method for faster generation when use_vllm is set to False."},
     )
@@ -371,13 +404,20 @@ class RLOOConfig(TrainingArguments):
             "model implementation."
         },
     )
-    vllm_guided_decoding_regex: Optional[str] = field(
+    vllm_enable_sleep_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory "
+            "usage low, but waking the engine adds host–device transfer latency."
+        },
+    )
+    vllm_guided_decoding_regex: str | None = field(
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
 
     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
-    vllm_server_base_url: Optional[str] = field(
+    vllm_server_base_url: str | None = field(
         default=None,
         metadata={
             "help": "Base URL for the vLLM server (e.g., 'http://localhost:8000'). If provided, `vllm_server_host` "
@@ -434,14 +474,14 @@ class RLOOConfig(TrainingArguments):
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
-    epsilon_high: Optional[float] = field(
+    epsilon_high: float | None = field(
         default=None,
         metadata={
             "help": "Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the "
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
         },
     )
-    reward_weights: Optional[list[float]] = field(
+    reward_weights: list[float] | None = field(
         default=None,
         metadata={
             "help": "Weights for each reward function. Must match the number of reward functions. If `None`, all "
@@ -455,7 +495,7 @@ class RLOOConfig(TrainingArguments):
             "and standard deviation of `1.0`."
         },
     )
-    reward_clip_range: Optional[tuple[float, float]] = field(
+    reward_clip_range: tuple[float, float] | None = field(
         default=None,
         metadata={"help": "Clip range for rewards as (min, max). If None, no clipping is applied."},
     )
@@ -498,136 +538,26 @@ class RLOOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
-    num_completions_to_print: Optional[int] = field(
+    num_completions_to_print: int | None = field(
         default=None,
         metadata={"help": "Number of completions to print with `rich`. If `None`, all completions are logged."},
     )
-    wandb_log_unique_prompts: Optional[bool] = field(
+    log_unique_prompts: bool = field(
         default=False,
         metadata={
-            "help": "Whether to log unique prompts in wandb. If `True`, only unique prompts are logged. If `False`, "
-            "all prompts are logged."
+            "help": "Whether to log unique prompts. If `True`, only unique prompts are logged. If `False`, all "
+            "prompts are logged."
         },
     )
 
-    # Deprecated params
-    rloo_k: Optional[int] = field(
+    # Deprecated arguments
+    wandb_log_unique_prompts: bool | None = field(
         default=None,
-        metadata={"help": "Deprecated: use `num_generations` instead."},
-    )
-    cliprange: Optional[float] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `epsilon` instead."},
-    )
-    kl_coef: Optional[float] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `beta` instead."},
-    )
-    exp_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `run_name` instead."},
-    )
-    normalize_reward: Optional[bool] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `normalize_advantages` instead."},
-    )
-    num_ppo_epochs: Optional[int] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `num_iterations` instead."},
-    )
-    num_mini_batches: Optional[int] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `steps_per_generation` instead."},
-    )
-    total_episodes: Optional[int] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `max_steps=total_episodes/(gradient_accumulation_steps*rloo_k)` instead."},
-    )
-    response_length: Optional[int] = field(
-        default=None,
-        metadata={"help": "Deprecated: use `max_completion_length` instead."},
-    )
-    token_level_kl: Optional[bool] = field(
-        default=None,
-        metadata={"help": "Removed: KL is now computed only at the sequence level."},
-    )
-    dataset_num_proc: Optional[int] = field(
-        default=None,
-        metadata={"help": "Removed: this parameter was unused, you can safely remove it from your scripts."},
-    )
-    local_rollout_forward_batch_size: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "Removed: now automatically set to `per_device_train_batch_size` (or `per_device_eval_batch_size` "
-            "during evaluation)."
-        },
-    )
-    num_sample_generations: Optional[int] = field(
-        default=None,
-        metadata={"help": "Removed: use `logging_steps` to control generation logging frequency."},
-    )
-    stop_token: Optional[str] = field(
-        default=None,
-        metadata={"help": "Removed."},
-    )
-    stop_token_id: Optional[int] = field(
-        default=None,
-        metadata={"help": "Removed: use `processing_class.eos_token_id` instead."},
-    )
-    missing_eos_penalty: Optional[float] = field(
-        default=None,
-        metadata={
-            "help": "Removed: replicate with a custom reward function checking if `eos_token_id` is in "
-            "`completion_ids`."
-        },
+        metadata={"help": "Deprecated, use `log_unique_prompts` instead."},
     )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
-
-        _DEPRECATED_PARAMS = {
-            "rloo_k": "num_generations",
-            "cliprange": "epsilon",
-            "kl_coef": "beta",
-            "exp_name": "run_name",
-            "normalize_reward": "normalize_advantages",
-            "num_ppo_epochs": "num_iterations",
-            "num_mini_batches": "steps_per_generation",
-            "total_episodes": "max_steps",
-            "response_length": "max_completion_length",
-        }
-
-        _REMOVED_PARAMS = {
-            "token_level_kl",
-            "dataset_num_proc",
-            "local_rollout_forward_batch_size",
-            "num_sample_generations",
-            "stop_token",
-            "stop_token_id",
-            "missing_eos_penalty",
-        }
-
-        # Check for deprecated parameters and issue warnings
-        for old_param, new_param in _DEPRECATED_PARAMS.items():
-            if getattr(self, old_param) is not None:
-                old_value = getattr(self, old_param)
-                if old_param == "total_episodes":
-                    old_value = old_value // self.gradient_accumulation_steps
-                warnings.warn(
-                    f"Parameter '{old_param}' is deprecated and will be removed in version 0.25.0. Please use "
-                    f"'{new_param}' instead. We are setting {new_param}={old_value}"
-                )
-                # Set the new parameter with the old value
-                setattr(self, new_param, old_value)
-                # Clear the deprecated parameter
-                setattr(self, old_param, None)
-
-        for removed_param in _REMOVED_PARAMS:
-            if hasattr(self, removed_param) and getattr(self, removed_param) is not None:
-                warnings.warn(
-                    f"Parameter '{removed_param}' is deprecated and will be removed in version 0.25.0. Please refer "
-                    "to the migration guide: https://huggingface.co/docs/trl/en/rloo_trainer##migration-guide-from-the-old-implementation-021-and-below"
-                )
 
         super().__post_init__()
 
@@ -671,6 +601,15 @@ class RLOOConfig(TrainingArguments):
 
         if self.num_generations < 2:
             raise ValueError(
-                "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
+                "RLOO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+
+        if self.wandb_log_unique_prompts is not None:
+            warnings.warn(
+                "The `wandb_log_unique_prompts` argument is deprecated and will be removed in version 0.27.0. Please "
+                "use `log_unique_prompts` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.log_unique_prompts = self.wandb_log_unique_prompts

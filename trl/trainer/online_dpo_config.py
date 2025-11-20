@@ -14,7 +14,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from transformers import TrainingArguments
 
@@ -33,9 +33,9 @@ class OnlineDPOConfig(TrainingArguments):
     command line.
 
     Parameters:
-        reward_model_path (`str` or `None`, *optional*, defaults to `None`):
+        reward_model_path (`str`, *optional*):
             Path to the reward model. Either `judge` or `reward_model_path` must be set, but not both.
-        judge (`str` or `None`, *optional*, defaults to `None`):
+        judge (`str`, *optional*):
             Name of the judge to use. Either `judge` or `reward_model_path` must be set, but not both.
         max_new_tokens (`int`, *optional*, defaults to `64`):
             Maximum number of tokens to generate per completion.
@@ -45,7 +45,7 @@ class OnlineDPOConfig(TrainingArguments):
             possible.
         temperature (`float`, *optional*, defaults to `0.9`):
             Temperature for sampling. The higher the temperature, the more random the completions.
-        missing_eos_penalty (`float` or `None`, *optional*, defaults to `None`):
+        missing_eos_penalty (`float`, *optional*):
             Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage to
             generate completions shorter than the maximum length (`max_new_tokens`). The penalty must be a positive
             value. This parameter only works when using `reward_funcs` and not when using `judge`.
@@ -59,9 +59,6 @@ class OnlineDPOConfig(TrainingArguments):
 
                 - `"sigmoid"`: sigmoid loss from the original [DPO](https://huggingface.co/papers/2305.18290) paper.
                 - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
-
-        dataset_num_proc (`int` or `None`, *optional*, defaults to `None`):
-            Number of processes to use for processing the dataset.
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model and reference model.
 
@@ -70,10 +67,10 @@ class OnlineDPOConfig(TrainingArguments):
         top_p (`float`, *optional*, defaults to `1.0`):
             Float that controls the cumulative probability of the top tokens to consider. Must be in (0, 1]. Set to
             `1.0` to consider all tokens.
-        top_k (`int` or `None`, *optional*, defaults to `None`):
+        top_k (`int`, *optional*):
             Number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, top-k-filtering is
             disabled and all tokens are considered.
-        min_p (`float` or `None`, *optional*, defaults to `None`):
+        min_p (`float`, *optional*):
             Minimum token probability, which will be scaled by the probability of the most likely token. It must be a
             value between `0.0` and `1.0`. Typical values are in the `0.01-0.2` range.
         repetition_penalty (`float`, *optional*, defaults to `1.0`):
@@ -84,13 +81,13 @@ class OnlineDPOConfig(TrainingArguments):
             Whether to use the `transformers` paged implementation for generation. If set to `True`, the `transformers`
             paged implementation will be used for generation instead of the default padded implementation. This
             parameter is only effective when `use_vllm` is set to `False`.
-        cache_implementation (`str` or `None`, *optional*, defaults to `None`):
+        cache_implementation (`str`, *optional*):
             Implementation of the cache method for faster generation when `use_vllm` is set to `False`.
-        generation_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
-            Additional keyword arguments to pass to `GenerationConfig` (if using transformers) or `SamplingParams` (if
-            using vLLM) when sampling completions. This can be used to further customize the generation behavior, such
-            as setting `supress_tokens`, `num_beams`, etc. If it contains keys that conflict with the other generation
-            parameters (like `min_p`, `top_p`, etc.), they will override them.
+        generation_kwargs (`dict[str, Any]`, *optional*):
+            Additional keyword arguments to pass to [`~transformers.GenerationConfig`] (if using transformers) or
+            `SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the
+            generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that conflict
+            with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them.
 
         > Parameters that control generation acceleration powered by vLLM
 
@@ -109,12 +106,12 @@ class OnlineDPOConfig(TrainingArguments):
               server is running (start with `trl vllm-serve`).
             - `"colocate"`: vLLM will run in the same process and share the training GPUs. This avoids the need for a
               separate server but may cause resource contention with training.
-        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+        vllm_guided_decoding_regex (`str`, *optional*):
             Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
 
         > Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
 
-        vllm_server_base_url (`str` or `None`, *optional*, defaults to `None`):
+        vllm_server_base_url (`str`, *optional*):
             Base URL for the vLLM server (e.g., `"http://localhost:8000"`). If provided, `vllm_server_host` and
             `vllm_server_port` are ignored.
         vllm_server_host (`str`, *optional*, defaults to `"0.0.0.0"`):
@@ -143,7 +140,7 @@ class OnlineDPOConfig(TrainingArguments):
             improving generation speed. However, disabling this option allows training models that exceed the VRAM
             capacity of a single GPU, albeit at the cost of slower generation. Disabling this option is not compatible
             with vLLM generation.
-        model_init_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
+        model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the model from a
             string.
     """
@@ -166,7 +163,7 @@ class OnlineDPOConfig(TrainingArguments):
             "help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."
         },
     )
-    bf16: Optional[bool] = field(
+    bf16: bool | None = field(
         default=None,
         metadata={
             "help": "Whether to use bf16 (mixed) precision instead of 32-bit. Requires Ampere or higher NVIDIA "
@@ -174,14 +171,24 @@ class OnlineDPOConfig(TrainingArguments):
             "`fp16` is not set."
         },
     )
+    # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
+    # was fixed in https://github.com/huggingface/transformers/pull/41322, but the fix has not yet been released. We
+    # add a temporary workaround here, which can be removed once the fix is available—likely in Transformers 4.57.2.
+    lr_scheduler_kwargs: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": "Additional parameters for the lr_scheduler, such as {'num_cycles': 1} for cosine with hard "
+            "restarts."
+        },
+    )
 
-    reward_model_path: Optional[str] = field(
+    reward_model_path: str | None = field(
         default=None,
         metadata={
             "help": "Path to the reward model. Either `judge` or `reward_model_path` must be set, but not both."
         },
     )
-    judge: Optional[str] = field(
+    judge: str | None = field(
         default=None,
         metadata={
             "help": "Name of the judge to use. Either `judge` or `reward_model_path` must be set, but not both."
@@ -210,14 +217,14 @@ class OnlineDPOConfig(TrainingArguments):
             "Set to 1.0 to consider all tokens."
         },
     )
-    top_k: Optional[int] = field(
+    top_k: int | None = field(
         default=None,
         metadata={
             "help": "Number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, "
             "top-k-filtering is disabled and all tokens are considered."
         },
     )
-    min_p: Optional[float] = field(
+    min_p: float | None = field(
         default=None,
         metadata={
             "help": "Minimum token probability, which will be scaled by the probability of the most likely token. It "
@@ -232,12 +239,12 @@ class OnlineDPOConfig(TrainingArguments):
             "to repeat tokens."
         },
     )
-    generation_kwargs: Optional[dict] = field(
+    generation_kwargs: dict | None = field(
         default=None,
         metadata={
             "help": "Additional keyword arguments to pass to `GenerationConfig` (if using transformers) or "
             "`SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the "
-            "generation behavior, such as setting `supress_tokens`, `num_beams`, etc. If it contains keys that "
+            "generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that "
             "conflict with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them."
         },
     )
@@ -249,11 +256,11 @@ class OnlineDPOConfig(TrainingArguments):
             "implementation. This parameter is only effective when `use_vllm` is set to `False`."
         },
     )
-    cache_implementation: Optional[str] = field(
+    cache_implementation: str | None = field(
         default=None,
         metadata={"help": "Implementation of the cache method for faster generation when use_vllm is set to False."},
     )
-    missing_eos_penalty: Optional[float] = field(
+    missing_eos_penalty: float | None = field(
         default=None,
         metadata={
             "help": "Penalty applied to the score when the model fails to generate an EOS token. This is useful to "
@@ -285,7 +292,7 @@ class OnlineDPOConfig(TrainingArguments):
         default=False,
         metadata={
             "help": "Whether to use vLLM for generating completions. Requires vLLM to be installed "
-            "(`pip install vllm`)."
+            "(`pip install trl[vllm]`)."
         },
     )
     vllm_model_impl: str = field(
@@ -296,11 +303,11 @@ class OnlineDPOConfig(TrainingArguments):
             "model implementation."
         },
     )
-    vllm_guided_decoding_regex: Optional[str] = field(
+    vllm_guided_decoding_regex: str | None = field(
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
-    vllm_gpu_memory_utilization: Optional[float] = field(
+    vllm_gpu_memory_utilization: float | None = field(
         default=0.55,
         metadata={
             "help": "Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set "
@@ -318,7 +325,7 @@ class OnlineDPOConfig(TrainingArguments):
             "contention with training.",
         },
     )
-    vllm_server_base_url: Optional[str] = field(
+    vllm_server_base_url: str | None = field(
         default=None,
         metadata={
             "help": "Base URL for the vLLM server (e.g., 'http://localhost:8000'). If provided, `vllm_server_host` "
@@ -357,31 +364,18 @@ class OnlineDPOConfig(TrainingArguments):
             "is not compatible with vLLM generation."
         },
     )
-    model_init_kwargs: Optional[dict[str, Any]] = field(
+    model_init_kwargs: dict[str, Any] | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the model "
             "from a string."
         },
     )
-    reward_weights: Optional[list[float]] = field(
+    reward_weights: list[float] | None = field(
         default=None,
         metadata={
             "help": "Weights for combining multiple reward functions. Must match the number of reward functions. "
             "If None, all reward functions are equally weighted."
-        },
-    )
-
-    # Deprecated parameters
-    dataset_num_proc: Optional[int] = field(
-        default=None,
-        metadata={"help": "Number of processes to use for processing the dataset."},
-    )
-    gpu_memory_utilization: Optional[float] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.25.0. Please use "
-            "`vllm_gpu_memory_utilization` instead.",
         },
     )
 
@@ -390,17 +384,12 @@ class OnlineDPOConfig(TrainingArguments):
 
         super().__post_init__()
 
-        if self.dataset_num_proc is not None:
-            warnings.warn(
-                "The parameter `dataset_num_proc` is deprecated and will be removed in version 0.25.0. "
-                "Since OnlineDPO does not involve dataset preparation, you can safely remove it.",
-            )
-        if self.gpu_memory_utilization is not None:
-            warnings.warn(
-                "The parameter `gpu_memory_utilization` is deprecated and will be removed in version 0.25.0. "
-                "Please use `vllm_gpu_memory_utilization` instead.",
-            )
-            self.vllm_gpu_memory_utilization = self.gpu_memory_utilization
-
         if hasattr(self.beta, "__len__") and len(self.beta) == 1:
             self.beta = self.beta[0]
+
+        if self.max_new_tokens >= self.max_length:
+            warnings.warn(
+                f"The configuration has `max_new_tokens` ({self.max_new_tokens}) >= `max_length` ({self.max_length}). "
+                "This will cause prompts to be truncated or completely removed in the forward pass. "
+                "To preserve prompts, ensure  e.g. `max_length > max_new_tokens + 512`. ",
+            )
